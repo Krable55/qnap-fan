@@ -3,6 +3,10 @@
 
 #![allow(clippy::todo)]
 
+mod control;
+mod ipc;
+mod state;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
