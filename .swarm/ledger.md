@@ -21,10 +21,10 @@ Stable IDs. Never renumber; record approved changes instead.
 | ID | Task | Serves | Depends on | Owner model | Status |
 |---|---|---|---|---|---|
 | T1 | M0 scaffold: workspace, crates, config schema, CI skeleton | R8 (partial) | — | sonnet-4-6 | DONE, coord-verified |
-| T2 | M1 qfan-hal: hwmon discovery, sysfs + fake backends | R3, R9 | T1 | sonnet-4-6 | pending |
-| T3 | M2 qfan-core: curves, slew, hysteresis, overrides | R1, R5 (validation) | T1 | sonnet-4-6 | pending |
+| T2 | M1 qfan-hal: hwmon discovery, sysfs + fake backends | R3, R9 | T1 | sonnet-4-6 | DONE, coord-verified (f5059e5) |
+| T3 | M2 qfan-core: curves, slew, hysteresis, overrides | R1, R5 (validation) | T1 | sonnet-4-6 | in progress |
 | T4 | M3 control loop + failsafe + dry-run | R1, R2, R3 | T2, T3 | sonnet-4-6 | pending |
-| T5 | M4 qfan-hist | R4 | T1 | sonnet-4-6 | pending |
+| T5 | M4 qfan-hist | R4 | T1 | sonnet-4-6 | DONE, coord-verified (0632b4b) |
 | T6 | M5 socket API + status subcommand | R5 | T4, T5 | sonnet-4-6 | pending |
 | T7 | M6 ratatui TUI | R6 | T6 | sonnet-4-6 | pending |
 | T8 | M7 plugin packaging | R7, R2 (watchdog) | T4 | sonnet-4-6 | pending |
@@ -96,3 +96,68 @@ libiconv, e.g.
 `export LIBRARY_PATH=/nix/store/7wxwini9iia901jpqyb9qzkmqlwyc88n-libiconv-1.18/lib`.
 Library crates build without it. CI on `ubuntu-latest` has system iconv and
 needs no workaround, so this never affects the shipping artifact.
+
+## T5 verification record (coordinator-run)
+
+- R4a-R4f: `cargo test -p qfan-hist` → 9 passed. Clippy/fmt clean.
+- Coordinator probe confirmed the properties that matter most:
+  - unwritten slot → `None` (gap), evicted/colliding bucket → `None`, never 0°C or stale
+  - bad magic → `Err("bad magic: expected QFRB, got [171,171,171,171]")`, not misread
+  - retention: T1 = 60s x 20160 = 14 days; T2 = 3600s x 43800 = **1825 days**, meets R4's 1-year floor
+  - T2 flash volume: 8760 writes/series/year, 27 series = 2.8 MB/year. Negligible, as DESIGN.md 6.2 claimed.
+- `RingBuffer::window_max(n)` exists and is what §4.2's trailing 30s CPU-max window needs. T4 should use it rather than rolling its own.
+- Committed 0632b4b.
+
+## T2 verification record (coordinator-run)
+
+- R9a-R9c, R3a: `cargo test -p qfan-hal` → 17 passed. Clippy/fmt clean.
+- R6 lockout is **structural, not advisory**: `PwmChannel` and `FanChannel` enums
+  cannot name pwm21 or fan22..35. This is the right implementation.
+- `EcBackend` is object-safe; daemon holds `Box<dyn EcBackend>`.
+- Rounding model verified against measured hardware: `round(180)=178`, `round(73)=71`,
+  `round(255)=255`, and lossy for 250/256 inputs, so T4's change-detection guard
+  will be meaningfully exercised.
+
+### F9 — cross-crate safety gap found in review (fix dispatched)
+
+Neither crate can see this alone. qfan-core's `validate()` enforces the 35%-duty
+floor as `intended pwm >= 89`. The EC *delivers* `ec_pwm_round(intended)`.
+Coordinator probe of the composition:
+
+```
+intended 89 -> delivered 86 (33% duty)   <-- validation accepts
+intended 90 -> delivered 89 (34% duty)
+intended 92 -> delivered 91 (35% duty)
+```
+
+A config that passes validation can deliver 33% duty above 80°C. The floor does
+not survive hardware rounding. Fix in flight: qfan-hal gains
+`ec_pwm_min_write_for(delivered_floor)` plus a verified 35% write-floor constant
+(expected 92); coordinator then applies the matching change to qfan-core's
+validation so the floor is expressed in *delivered* duty.
+
+**Lesson for later tasks:** per-crate green tests cannot catch floor/rounding
+composition errors. Any safety invariant stated in intended units must be
+re-checked in delivered units at the crate boundary.
+
+### F9 resolved (f5059e5)
+
+`ec_pwm_min_write_for(delivered_floor)` is a `const fn`; `EC_DUTY_FLOOR_35PCT`
+is computed at compile time and equals **90**, not the 92 I estimated. Coordinator
+re-verified: write 90 delivers 89 (34% duty); write 89 delivers 86 (33%); one less
+than the constant fails the floor, so it is minimal. The worker verified the value
+instead of trusting my guess, which is the correct behaviour.
+
+FakeBackend latency: default `latency_scale = 0.0`, no sleeping. Coordinator
+measured 200 EC reads at default = **86 microseconds**. Only `ec_latency_realtime_r3a`
+sets scale 1.0. T4's control-loop tests will not sleep. Resolved.
+
+### A2 — coordinator TODO, blocked on T3
+
+qfan-core's `validate()` still enforces the floor in INTENDED units (`pwm >= 89`).
+It must enforce DELIVERED duty instead. qfan-core cannot depend on qfan-hal
+(layering inversion), so the fix is to move `ec_pwm_round` + `ec_pwm_min_write_for`
+down into qfan-core as pure arithmetic and re-export them from qfan-hal (which
+already depends on qfan-core). **Serialized behind T3**: the T3 worker is editing
+qfan-core right now, so applying this concurrently would conflict. Do it after T3
+lands and before T4 consumes either crate.
