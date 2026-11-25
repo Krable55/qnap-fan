@@ -3,7 +3,7 @@
   <!ENTITY name        "qnap-fan">
   <!ENTITY author      "Kyle Rable">
   <!ENTITY version     "2026.11.24">
-  <!ENTITY github      "OWNER/qnap-fan">
+  <!ENTITY github      "Krable55/qnap-fan">
   <!ENTITY plugdir     "/boot/config/plugins/&name;">
   <!ENTITY emhttp      "/usr/local/emhttp/plugins/&name;">
   <!ENTITY PACKAGE     "&name;-&version;.txz">

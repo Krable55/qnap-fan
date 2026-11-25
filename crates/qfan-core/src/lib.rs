@@ -269,7 +269,7 @@ fn validate_channel(ch: &ChannelConfig, name: &str) -> Result<(), ConfigError> {
         }
     }
 
-    // Sweep every whole-degree temperature from 80 to 110 °C inclusive.
+    // Sweep every whole-degree temperature from SWEEP_FLOOR_C to 110 °C inclusive.
     // pwm_at() uses the same piecewise-linear + clamp logic the daemon uses,
     // so this catches breakpoint values, interpolated values, AND the clamp
     // region above the last breakpoint — the case the per-breakpoint check missed.
@@ -278,7 +278,13 @@ fn validate_channel(ch: &ChannelConfig, name: &str) -> Result<(), ConfigError> {
     // writes down to whole percent, so an intended 89 is delivered as 86 (33%
     // duty). Comparing the intended value against 89 would accept a curve that
     // physically runs below the 35% safety floor.
-    for t in 80i16..=110 {
+    //
+    // The sweep starts at 75 °C rather than the emergency threshold. At 80 °C a
+    // curve could legally sit at minimum duty right up to 79 °C and this package
+    // climbs ~20 °C in seconds under load, so the window between "quiet" and
+    // "latched" was wide enough to matter. 75 °C is below any temperature at
+    // which low airflow is defensible on this hardware.
+    for t in SWEEP_FLOOR_C..=110 {
         let intended = ch.pwm_at(t);
         let delivered = ec_pwm_round(intended);
         if delivered < DELIVERED_DUTY_FLOOR {
@@ -331,6 +337,16 @@ pub const fn ec_pwm_min_write_for(delivered_floor: u8) -> u8 {
 
 /// Delivered-PWM floor corresponding to 35% duty.
 pub const DELIVERED_DUTY_FLOOR: u8 = 89;
+
+/// Lowest temperature at which `validate()` enforces the duty floor (§4.2).
+///
+/// Set below the emergency threshold on purpose. The latch only engages at
+/// `emergency_temp_c` (90 °C by default), and this package has been observed
+/// climbing ~20 °C within seconds of a load spike, so any band where a curve may
+/// legally sit at minimum duty while already hot is a real exposure window and
+/// not a theoretical one. Sweeping from 75 °C closes it without rejecting
+/// legitimately quiet curves, which this hardware only justifies well below 75 °C.
+pub const SWEEP_FLOOR_C: i16 = 75;
 
 /// Smallest WRITE value that delivers at least 35% duty (≥ 89 after rounding).
 ///
@@ -1167,6 +1183,86 @@ pwm = 180
         assert_eq!(
             d.intended_pwm, 255,
             "curve at 85°C (above last breakpoint 70°C→255) must give 255, not stale floor"
+        );
+    }
+
+    /// F2: the 79 °C cliff. Before the sweep floor was lowered to 75 °C this
+    /// config validated cleanly and delivered 4% duty at 79 °C, one degree below
+    /// the old sweep start. Fails against `SWEEP_FLOOR_C = 80`.
+    #[test]
+    fn f2_sub_80c_cliff_rejected() {
+        let mut c = Config::default();
+        c.pwm7.breakpoints = vec![
+            CurvePoint {
+                temp_c: 79,
+                pwm: 10,
+            },
+            CurvePoint {
+                temp_c: 80,
+                pwm: 90,
+            },
+        ];
+        let err = c
+            .validate()
+            .expect_err("a 4% duty at 79 °C must be rejected");
+        let msg = err.to_string();
+        // The sweep reports the FIRST offending degree, which is now SWEEP_FLOOR_C
+        // itself: the clamp region below the 79 °C breakpoint holds pwm 10 all the
+        // way down, so 75 °C fails before 79 °C is reached. Either way the config
+        // is rejected, which is the property under test.
+        assert!(
+            msg.contains("below the 35% duty minimum"),
+            "error should cite the duty floor: {msg}"
+        );
+        // The exposure band 75..=79 is now covered end to end.
+        for t in SWEEP_FLOOR_C..80 {
+            let mut c = Config::default();
+            c.pwm7.breakpoints = vec![
+                CurvePoint { temp_c: t, pwm: 10 },
+                CurvePoint {
+                    temp_c: 80,
+                    pwm: 90,
+                },
+            ];
+            assert!(
+                c.validate().is_err(),
+                "minimum duty at {t}°C must be rejected once the sweep starts at {SWEEP_FLOOR_C}"
+            );
+        }
+    }
+
+    /// Curves that are quiet BELOW the sweep floor stay legal — lowering the
+    /// floor must not reject a legitimately quiet config.
+    #[test]
+    fn f2_quiet_below_sweep_floor_still_allowed() {
+        let mut c = Config::default();
+        c.pwm7.breakpoints = vec![
+            CurvePoint {
+                temp_c: 40,
+                pwm: 60,
+            },
+            CurvePoint {
+                temp_c: 74,
+                pwm: 60,
+            },
+            CurvePoint {
+                temp_c: 75,
+                pwm: EC_DUTY_FLOOR_35PCT,
+            },
+            CurvePoint {
+                temp_c: 90,
+                pwm: 255,
+            },
+        ];
+        assert!(
+            c.validate().is_ok(),
+            "quiet below {SWEEP_FLOOR_C}°C must remain legal: {:?}",
+            c.validate()
+        );
+        assert_eq!(
+            c.pwm7.pwm_at(60),
+            60,
+            "the quiet region must be preserved as written"
         );
     }
 
