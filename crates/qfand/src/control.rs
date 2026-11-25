@@ -76,7 +76,11 @@ pub fn parse_disks_ini(path: &str) -> Vec<(String, Option<i16>)> {
             if let Some(name) = current_name.take() {
                 results.push((name, current_temp.take()));
             }
-            current_name = Some(trimmed[1..trimmed.len() - 1].to_owned());
+            // disks.ini section headers are quoted: ["parity"]. Strip the
+            // brackets AND the quotes — leaving them produced disk names like
+            // "\"parity\"" in the socket API and the webGUI, which then cannot
+            // be matched against an Unraid disk name by any consumer.
+            current_name = Some(trimmed[1..trimmed.len() - 1].trim_matches('"').to_owned());
             current_temp = None;
         } else if let Some(rest) = trimmed.strip_prefix("temp=") {
             let val = rest.trim_matches('"');
@@ -606,6 +610,32 @@ mod tests {
             writes2, 0,
             "repeated identical intended values must not rewrite"
         );
+    }
+
+    /// disks.ini section headers are quoted. Leaving the quotes in produced
+    /// disk names like `"\"parity\""` in the socket API and the webGUI, found
+    /// by querying the live daemon on the NAS after cutover.
+    #[test]
+    fn disk_names_are_unquoted() {
+        let dir = std::env::temp_dir().join(format!("qfand_ini_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("disks.ini");
+        std::fs::write(
+            &path,
+            "[\"parity\"]\nname=\"parity\"\ntemp=\"33\"\n\n[\"disk1\"]\ntemp=\"31\"\n",
+        )
+        .unwrap();
+
+        let got = parse_disks_ini(path.to_str().unwrap());
+        let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["parity", "disk1"],
+            "disk names must carry no surrounding quotes"
+        );
+        assert_eq!(got[0].1, Some(330), "33C must parse to 330 deci-C");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── Failsafe guard: normal drop writes 255 ────────────────────────────────
