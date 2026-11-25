@@ -19,6 +19,8 @@ qfan-core = { path = "../qfan-core" }
 qfan-hal = { path = "../qfan-hal" }
 qfan-hist = { path = "../qfan-hist" }
 qfan-proto = { path = "../qfan-proto" }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

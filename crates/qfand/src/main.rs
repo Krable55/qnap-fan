@@ -10,6 +10,7 @@
 mod control;
 mod ipc;
 mod state;
+mod tui;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -156,8 +157,8 @@ async fn run_daemon(config_path: &Path, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-async fn run_tui(_config: &Path) -> Result<()> {
-    todo!("T6: connect to daemon socket, render ratatui interface")
+async fn run_tui(config: &Path) -> Result<()> {
+    tui::run_tui(config).await
 }
 
 /// Connect to the daemon socket, send Status, and pretty-print the response.

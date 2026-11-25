@@ -573,3 +573,62 @@ acceptable when a real platform can run it.
 genuinely required. `tempfile` is dev-only. Notably the `sync` feature was NOT
 added; the earlier `module sync is private` error was resolved properly rather
 than by broadening features.
+
+## T7 (ratatui TUI) — verified, M6 complete
+
+42 tests in qfand (was 26), 2 conditionally ignored on macOS only. Workspace:
+qfan-core 22, qfan-hist 9, qfand 42 = 73. clippy -D warnings clean, fmt clean,
+`cargo build --release -p qfand` succeeds.
+
+Worker got the things that have bitten this project before, unprompted by history
+(the brief carried the lessons, not the incident list):
+- `#[cfg_attr(target_os = "macos", ignore = ...)]` on the panic-unwind test, NOT
+  plain `#[ignore]` — the F12/R2 lesson applied pre-emptively.
+- Curve editor defers ALL validation to the daemon and shows its rejection
+  verbatim; no client-side pre-validation that could disagree with the authority.
+- R6: the only mention of pwm21/fan22-35 in tui.rs is a comment saying they are
+  never shown.
+- Terminal restore via BOTH `install_panic_hook` (chains to the previous hook) and
+  an RAII `TermGuard`; `restore_terminal()` is idempotent.
+- 1 Hz poll / 100 ms render / 3 s socket timeout. Reconnect is implicit: each poll
+  reconnects, so a daemon restart self-heals without special-case code.
+
+### F13 — gap tests proved the helper, not the screen (fixed by coordinator)
+
+All six of the worker's gap tests exercised `history_to_segments`, a pure
+function. Good logic coverage, but nothing asserted a gap never reaches the
+rendered output — `history_with_gaps_renders_without_panic` only checked for
+absence of panic. A renderer could plot the sentinel independently of the helper
+and every test would still pass.
+
+Added `gaps_never_reach_the_rendered_buffer`: renders a real outage
+(valid, valid, NO_DATA, NO_DATA, count=0, valid, valid) to a 120x40 TestBackend,
+asserts the buffer contains no "-32768"/"-3276.8"/"32768", and asserts the
+plotted points exclude buckets 2..4 and are all > 0 °C.
+
+### F14 — the sentinel branch of `is_gap` was never tested (fixed by coordinator)
+
+Mutation testing of `is_gap`:
+
+| Mutation | Before fix | After fix |
+|---|---|---|
+| drop `count == 0` signal | CAUGHT | CAUGHT |
+| **drop the NO_DATA sentinel signal** | **SURVIVED** | CAUGHT |
+| `is_gap` always false | CAUGHT | CAUGHT |
+
+Root cause: EVERY `no_data_slot` fixture also set `count: 0`, so no test could
+distinguish the two branches. Deleting the entire sentinel check left all 41
+tests green. The daemon does currently write both together — but `is_gap`
+promises to catch either signal independently, and an untested branch of a
+safety-display rule is exactly the F8/F9 pattern: the invariant held by accident
+of the fixtures, not by enforcement.
+
+Added `sentinel_only_slot(bucket)` with `count: 7` plus
+`sentinel_alone_is_a_gap_without_count_zero`. All three mutations now caught.
+
+### Known limitation (accepted)
+
+The terminal-restore tests use a local `MockGuard` with the same Drop shape
+rather than the real `TermGuard`, because the real guard needs a live terminal.
+Drop semantics are verified; the actual escape sequences are not. Will be
+exercised for real during the M9 SSH session on the NAS.
