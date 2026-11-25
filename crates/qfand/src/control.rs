@@ -41,11 +41,17 @@ impl FailsafeGuard {
 
 impl Drop for FailsafeGuard {
     fn drop(&mut self) {
-        eprintln!("[qfand] FAILSAFE: setting pwm1=255 pwm7=255");
-        if !self.dry_run {
-            let _ = self.backend.write_pwm(PwmChannel::Pwm1, 255);
-            let _ = self.backend.write_pwm(PwmChannel::Pwm7, 255);
+        if self.dry_run {
+            // Say what actually happened. The guard is correct in dry-run — it
+            // suppresses the write — but logging an unconditional "setting
+            // pwm=255" while writing nothing teaches the operator to distrust
+            // the log at the exact moment they are auditing a dry run.
+            eprintln!("[qfand dry-run] FAILSAFE would set pwm1=255 pwm7=255 (no write performed)");
+            return;
         }
+        eprintln!("[qfand] FAILSAFE: setting pwm1=255 pwm7=255");
+        let _ = self.backend.write_pwm(PwmChannel::Pwm1, 255);
+        let _ = self.backend.write_pwm(PwmChannel::Pwm7, 255);
     }
 }
 
@@ -623,6 +629,42 @@ mod tests {
             backend.read_pwm(PwmChannel::Pwm7).unwrap(),
             255,
             "failsafe guard must set pwm7=255 on normal drop"
+        );
+    }
+
+    /// Dry-run must not write, and must not CLAIM to have written. The guard
+    /// was always correct here; the log line was not — it announced
+    /// "FAILSAFE: setting pwm1=255 pwm7=255" while writing nothing, which
+    /// trains the operator to distrust the log at the exact moment they are
+    /// auditing a dry run on live hardware.
+    #[test]
+    fn failsafe_guard_dry_run_writes_nothing() {
+        let backend = Arc::new(FakeBackend::new());
+        // FakeBackend applies ec_pwm_round on write (F7), so seed with values
+        // that survive the rounding — otherwise the assertion below fails on
+        // the fixture's arithmetic rather than on the behaviour under test.
+        backend.write_pwm(PwmChannel::Pwm1, 128).unwrap();
+        backend.write_pwm(PwmChannel::Pwm7, 128).unwrap();
+        let seeded_1 = backend.read_pwm(PwmChannel::Pwm1).unwrap();
+        let seeded_7 = backend.read_pwm(PwmChannel::Pwm7).unwrap();
+
+        {
+            let _guard = FailsafeGuard::new(Arc::clone(&backend) as Arc<dyn EcBackend>, true);
+        } // guard drops here
+
+        assert_eq!(
+            backend.read_pwm(PwmChannel::Pwm1).unwrap(),
+            seeded_1,
+            "dry-run failsafe must leave pwm1 untouched"
+        );
+        assert_eq!(
+            backend.read_pwm(PwmChannel::Pwm7).unwrap(),
+            seeded_7,
+            "dry-run failsafe must leave pwm7 untouched"
+        );
+        assert_ne!(
+            seeded_1, 255,
+            "fixture must not pre-seed the failsafe value"
         );
     }
 
