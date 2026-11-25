@@ -14,7 +14,11 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
+serde_json = { workspace = true }
 qfan-core = { path = "../qfan-core" }
 qfan-hal = { path = "../qfan-hal" }
 qfan-hist = { path = "../qfan-hist" }
 qfan-proto = { path = "../qfan-proto" }
+
+[dev-dependencies]
+tempfile = "3"

@@ -450,3 +450,126 @@ because cargo manifest warnings are not lints.
 `crates/qfan-core/tests/coord_verify.rs` (a coordinator probe) had survived into
 the working tree and was caught by `git status` before the commit. Probe files
 must be deleted in the same call that runs them, or they ship.
+
+## T4 / T6 dispatched in parallel — handoff contract written by coordinator first
+
+`crates/qfand/src/state.rs` (commit 1729ed3) is the ONLY shared surface. Written
+by the coordinator rather than negotiated between two workers editing one file.
+The split is what enforces R1 structurally:
+
+- control loop = sole PWM writer, sole caller of `qfan_core::decide`
+- socket server = reads snapshots, queues `state::Command` for the loop
+
+`ChannelSnapshot` keeps `intended_pwm` and `readback_pwm` as separate fields with
+the F7 warning in the type docs. `publish()` takes a closure so the critical
+section cannot accidentally wrap a 12-18 ms EC read (F6).
+
+## T6 (socket API) — coordinator review COMPLETE
+
+PASS so far:
+- **R1 boundary respected.** `grep -E "decide\(|write_pwm|qfan_hal|/sys/"` on
+  ipc.rs returns only a comment stating it does none of those. No EC access.
+- Stale-socket unlink before bind, `chmod 0o660`, 30 s read timeout,
+  `MAX_LINE_BYTES = 65_536` cap, per-client `tokio::spawn` so a silent client
+  cannot stall others.
+- **Override delegates to `qfan_core::Override::new`** and surfaces its error
+  verbatim instead of reimplementing the duty floor. This is the F9 lesson
+  applied by a worker that never saw F9 — the brief carried it.
+- **Gap-vs-zero correct**: `None` slot → `NO_DATA` (i16::MIN) AND `count: 0`, so
+  clients get two independent signals that downtime is not 0 °C.
+
+### F11 — silent success on an unknown channel (MEDIUM)
+
+`handle_set_curve` validates the channel against an allowlist and returns
+`unknown channel ...; use pwm1 or pwm7`. But `handle_override` and
+`handle_clear_override` do NOT: any channel string is accepted and returns
+`Ack::Ok`. The control loop then silently ignores it:
+
+```rust
+Command::SetOverride { channel, ov } => {
+    if channel == "pwm7" { ... } else if channel == "pwm1" { ... }
+    // no else — dropped silently
+}
+```
+
+Not a thermal hole: R6 remains structurally safe because qfan-hal's enums cannot
+name pwm21, and no write occurs. But a client that POSTs
+`{"op":"override","channel":"pwm21",...}` is told OK while nothing happens. For a
+thermally dangerous operation, reporting success for a no-op is wrong. Fix: apply
+the same allowlist in the override handlers, and make the control loop log
+instead of silently dropping.
+
+## Compile state note (not a defect)
+
+While T4 was still editing, `cargo test -p qfand` failed with 3 errors, ALL in
+T4-owned files: `DeciUnits is private` (control.rs:472) and `module sync is
+private` ×2 (main.rs:91, control.rs:439 — the `tokio` `sync` feature is not
+enabled in qfand's Cargo.toml). Attributed to the in-flight worker, not to T6,
+and deliberately NOT fixed by the coordinator mid-edit.
+
+## T4 (control loop) + T6 (socket API) — both verified, M3/M5 ready
+
+26 tests in qfand (10 control + 16 ipc), 1 conditionally ignored. Full workspace:
+qfan-core 22, qfan-hist 9, qfand 26; clippy -D warnings clean; fmt clean.
+
+### Mutation-verified safety properties
+
+| Mutation | Result |
+|---|---|
+| F7: compare against EC read-back instead of last-intended | CAUGHT |
+| trailing max: `window_max(TRAILING_MAX_SLOTS)` → `window_max(1)` | CAUGHT |
+| F11: remove channel guard from `handle_override` | CAUGHT |
+
+The F7 mutation is the important one: swapping the comparison to a sysfs
+read-back is exactly the permanent-rewrite treadmill, and the test fails when it
+is introduced. `maybe_write` compares `intended == *last` where `last` is
+`last_written_pwm7` — the intended value, never a read-back.
+
+**Coordinator harness error repeated (3rd time).** `replace(old,new,1)` hit a
+COMMENT containing `window_max` on line 247 instead of the call on line 278, so
+the mutation was a no-op and reported SURVIVED. Anchoring on the unique call text
+`.window_max(TRAILING_MAX_SLOTS)` caught it immediately. **This failure mode is
+now predictable: always anchor mutations on text unique to the code path, and
+treat an unexpected SURVIVED as harness-suspect before code-suspect.**
+
+### R1/R6 verified structurally
+
+- `decide()` is called in exactly two places, both in `control.rs::tick`, one per
+  channel. `ipc.rs` never calls it (only a comment stating so).
+- No `pwm21`/`fan22-35` reference anywhere in qfand except the F11 test strings
+  that assert they are REJECTED.
+
+### F12 — worker reported clippy clean; it was not (LOW, fixed)
+
+`cargo clippy -p qfand --all-targets -- -D warnings` failed with 2 real errors:
+`manual_is_multiple_of` at control.rs:256 and :270. The worker's self-report
+claimed all three gates passed. Fixed by the coordinator
+(`self.tick.is_multiple_of(self.fan_every_ticks)`). **Self-reported gate results
+are not evidence; re-run every gate.**
+
+### R2 panic-unwind test was unconditionally #[ignore]d — now macOS-only
+
+The worker marked `failsafe_guard_panic_unwind_writes_255` as `#[ignore]` with an
+honest diagnosis: `panic!()` aborts on this Darwin 25 + Nix toolchain
+(`fatal runtime error: failed to initiate panic, error 5`). Coordinator confirmed
+the abort independently — the diagnosis is correct, and the same quirk hit the
+earlier qfan-core mutation runs.
+
+But an unconditional `#[ignore]` means the test never runs ANYWHERE, including
+Linux, which is the deployment target. Changed to:
+
+```rust
+#[cfg_attr(target_os = "macos", ignore = "...; runs in CI on Linux")]
+```
+
+CI runs ubuntu-latest, so the unwind path is now exercised on every push. R2 is
+the reason this daemon exists; leaving its most critical test permanently
+unexecuted and substituting an argument from Rust's Drop guarantee is not
+acceptable when a real platform can run it.
+
+### Dependency changes reviewed
+
+`io-util` added to the workspace tokio features and `serde_json` to qfand — both
+genuinely required. `tempfile` is dev-only. Notably the `sync` feature was NOT
+added; the earlier `module sync is private` error was resolved properly rather
+than by broadening features.
