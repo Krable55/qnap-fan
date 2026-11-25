@@ -378,3 +378,75 @@ clippy --all-targets -D warnings: 0 errors
 cargo fmt --check: OK
 cargo build -p qfan-hal: Finished (re-exports intact)
 ```
+
+## Q5 RESOLVED (user: "Lower to 75") — F2 closed
+
+`SWEEP_FLOOR_C: i16 = 75` added next to the other duty-floor constants;
+`validate()` now sweeps `SWEEP_FLOOR_C..=110`.
+
+Checked against the defaults BEFORE changing the bound, so the decision was not
+made blind:
+
+```
+pwm1: 75C..81C -> intended 180 / delivered 178   (floor is 89)
+pwm7: 75C..81C -> intended 255 / delivered 255
+```
+
+Both are far above the floor, so lowering the sweep rejects nothing legitimate.
+
+Two tests added:
+- `f2_sub_80c_cliff_rejected` — the original F2 config `[{79,10},{80,90}]`, plus
+  every degree in 75..=79. **Reverting SWEEP_FLOOR_C to 80 makes this test fail**
+  (verified by mutation), so it measures the constant instead of restating it.
+- `f2_quiet_below_sweep_floor_still_allowed` — a curve quiet below 75 °C stays
+  legal and `pwm_at(60)` is preserved as written. Guards against the fix
+  over-rejecting.
+
+Note on the error message: the sweep reports the FIRST offending degree, which is
+now 75 °C rather than 79 °C, because the clamp region below the 79 °C breakpoint
+holds pwm 10 all the way down. My first assertion asserted on "79" and failed;
+the assertion was wrong, not the code.
+
+## Q6 RESOLVED (user: "create the remote using the gh cli")
+
+`gh repo create qnap-fan --private --source=. --remote=origin` →
+https://github.com/Krable55/qnap-fan (PRIVATE — flip to public when ready to
+publish, since the .plg download URLs must be publicly reachable for Unraid to
+install from them).
+
+`.plg` entity `&github;` now `Krable55/qnap-fan`. Resolved URLs verified by
+expanding the entity graph:
+
+```
+https://github.com/Krable55/qnap-fan/releases/download/v2026.11.24/qnap-fan-2026.11.24.txz
+https://github.com/Krable55/qnap-fan/releases/download/v2026.11.24/qnap-fan-2026.11.24.txz.sha256
+```
+
+These match the names the release workflow publishes (`qnap-fan-${VERSION}.txz`
++ `.sha256`). No `OWNER` placeholder remains anywhere in .github/, plugin/, or
+DESIGN.md.
+
+### CI verified on real infrastructure — run 45544351922, conclusion success
+
+```
+✓ Check formatting
+✓ Clippy (all targets, deny warnings)
+✓ Tests
+✓ Build musl release (native on ubuntu-latest x86_64, no cross-linker needed)
+```
+
+This is the first evidence the build works anywhere other than this Mac, and it
+confirms D6/R2: the musl target builds natively on a GH runner, so the aarch64
+cross-linker problem never has to be solved.
+
+**Known benign warnings** (NOT suppressed): `unused dependency qfan-hal`,
+`qfan-hist`, `qfan-proto` in `crates/qfand/Cargo.toml`. `qfand` is still the M0
+stub; T4 wires these up. Left visible on purpose — they are an accurate statement
+that the daemon is not yet implemented. Note `-D warnings` does not catch these
+because cargo manifest warnings are not lints.
+
+## Stray-file hygiene
+
+`crates/qfan-core/tests/coord_verify.rs` (a coordinator probe) had survived into
+the working tree and was caught by `git status` before the commit. Probe files
+must be deleted in the same call that runs them, or they ship.
