@@ -83,10 +83,14 @@ impl ChannelConfig {
     /// - Below the first breakpoint: clamp to the first breakpoint's pwm.
     /// - Between breakpoints: linearly interpolate.
     /// - Above the last breakpoint: clamp to the last breakpoint's pwm.
+    ///
+    /// Returns 255 for empty breakpoints (fail-safe). `validate()` also rejects
+    /// empty breakpoints, so this case requires bypassing validation; this is
+    /// defence in depth — empty curves must never produce fans-off.
     pub fn pwm_at(&self, temp_c: i16) -> u8 {
         let bp = &self.breakpoints;
         if bp.is_empty() {
-            return 0;
+            return 255;
         }
         if temp_c <= bp[0].temp_c {
             return bp[0].pwm;
@@ -226,6 +230,7 @@ impl Config {
     /// - Breakpoints must be strictly monotonic in temperature.
     /// - PWM 0–255 is enforced by the `u8` type at deserialization.
     /// - No curve may allow PWM < 89 (< 35% duty) at temperatures ≥ 80 °C.
+    /// - `slew_down_max` must be at least 1; 0 would prevent fans from ever ramping down.
     pub fn validate(&self) -> Result<(), ConfigError> {
         validate_channel(&self.pwm7, "pwm7")?;
         validate_channel(&self.pwm1, "pwm1")?;
@@ -242,6 +247,14 @@ fn validate_channel(ch: &ChannelConfig, name: &str) -> Result<(), ConfigError> {
     if ch.breakpoints.is_empty() {
         return Err(ConfigError::Validation(format!(
             "{name}: breakpoints must not be empty"
+        )));
+    }
+
+    // slew_down_max = 0 would prevent fans from ever ramping down (D2).
+    if ch.slew_down_max == 0 {
+        return Err(ConfigError::Validation(format!(
+            "{name}: slew_down_max must be at least 1; \
+             0 would permanently prevent fans from ramping down"
         )));
     }
 
@@ -328,11 +341,13 @@ pub const EC_DUTY_FLOOR_35PCT: u8 = ec_pwm_min_write_for(DELIVERED_DUTY_FLOOR);
 
 // ── Override ──────────────────────────────────────────────────────────────────
 
-/// Error from constructing an [`Override`] with an invalid TTL.
+/// Error from constructing an [`Override`] with an invalid argument.
 #[derive(Debug, Error)]
 pub enum OverrideError {
     #[error("ttl_s {ttl_s} out of range; must be 1..={max}")]
     InvalidTtl { ttl_s: u32, max: u32 },
+    #[error("pwm {pwm} is below the 35% duty minimum; use at least {min}")]
+    PwmBelowFloor { pwm: u8, min: u8 },
 }
 
 /// A manual PWM override with a mandatory expiry (§4.4).
@@ -342,6 +357,11 @@ pub enum OverrideError {
 /// compile-time error. An out-of-range TTL is returned as an `Err`, never
 /// silently clamped. This is the type-system encoding of "an override with no
 /// timeout is the failure mode that crashed this server."
+///
+/// Additionally, `pwm` must be at least `EC_DUTY_FLOOR_35PCT` (90). An override
+/// below the 35% duty floor is rejected at construction: the 80–89°C range is not
+/// covered by the emergency latch, so an override at 10% duty while the CPU is
+/// at 85°C would deliver dangerously low airflow with no hardware recovery.
 #[derive(Debug, Clone)]
 pub struct Override {
     pub pwm: u8,
@@ -354,8 +374,9 @@ impl Override {
     /// Hard cap: 1 hour. No override may exceed this.
     pub const MAX_TTL_S: u32 = 3_600;
 
-    /// Construct an override. `ttl_s` must be in `1..=MAX_TTL_S`; anything
-    /// outside that range is an error, not a silent clamp.
+    /// Construct an override.
+    /// - `ttl_s` must be in `1..=MAX_TTL_S`; anything outside is an error, not a clamp.
+    /// - `pwm` must be at least `EC_DUTY_FLOOR_35PCT` (90); anything below is an error.
     pub fn new(pwm: u8, ttl_s: u32, now_secs: u64) -> Result<Self, OverrideError> {
         if ttl_s == 0 || ttl_s > Self::MAX_TTL_S {
             return Err(OverrideError::InvalidTtl {
@@ -363,9 +384,17 @@ impl Override {
                 max: Self::MAX_TTL_S,
             });
         }
+        if pwm < EC_DUTY_FLOOR_35PCT {
+            return Err(OverrideError::PwmBelowFloor {
+                pwm,
+                min: EC_DUTY_FLOOR_35PCT,
+            });
+        }
         Ok(Self {
             pwm,
-            expires_at_secs: now_secs + ttl_s as u64,
+            // saturating_add: now_secs near u64::MAX saturates to u64::MAX, keeping
+            // is_active() = true rather than wrapping to a past timestamp (G1).
+            expires_at_secs: now_secs.saturating_add(ttl_s as u64),
         })
     }
 
@@ -432,6 +461,10 @@ pub enum ControlMode {
 pub struct ControlDecision {
     pub intended_pwm: u8,
     pub mode: ControlMode,
+    /// True when an active manual override was cleared because the emergency
+    /// latch just engaged. The daemon should log this event: the operator's
+    /// earlier manual setting has been discarded in favour of the failsafe.
+    pub override_cleared: bool,
 }
 
 // ── Channel state ─────────────────────────────────────────────────────────────
@@ -479,6 +512,13 @@ impl ChannelState {
 /// 3. Active manual override → `override.pwm`.
 /// 4. Curve + asymmetric slew + hysteresis.
 ///
+/// # Emergency latch update
+/// This function calls `emergency.update()` internally using `emergency_temp` and
+/// `release_temp`, so the caller cannot call `decide()` before updating the latch.
+/// When the latch transitions from inactive to active, any active override is cleared
+/// and `ControlDecision::override_cleared` is set to `true` — the daemon should log
+/// this, as the operator's earlier manual setting has been discarded.
+///
 /// # Hysteresis
 /// The deadband filter is applied to the **temperature signal** before curve
 /// evaluation, not to the PWM output. Rising temperature updates the reference
@@ -495,7 +535,9 @@ pub fn decide(
     temp: Option<i16>,
     channel: &mut ChannelState,
     config: &ChannelConfig,
-    emergency: &EmergencyLatch,
+    emergency: &mut EmergencyLatch,
+    emergency_temp: i16,
+    release_temp: i16,
     now_secs: u64,
 ) -> ControlDecision {
     // 1. Sensor failure: unreadable temperature is treated as hot.
@@ -505,17 +547,29 @@ pub fn decide(
             return ControlDecision {
                 intended_pwm: 255,
                 mode: ControlMode::FailSafe,
+                override_cleared: false,
             };
         }
         Some(t) => t,
     };
 
-    // 2. Emergency latch takes precedence over any manual override.
+    // 2. Update emergency latch. When the latch engages (false→true), any active
+    //    override is cleared: the operator's earlier manual judgement is not
+    //    trustworthy while the machine is in thermal distress, and a stale
+    //    override at the duty floor could hold fans slow after the latch releases
+    //    into a hot state (A2).
+    let just_engaged = emergency.update(temp_c, emergency_temp, release_temp);
+    let override_cleared = just_engaged && channel.active_override.is_some();
+    if override_cleared {
+        channel.clear_override();
+    }
+
     if emergency.is_latched() {
         channel.last_intended_pwm = 255;
         return ControlDecision {
             intended_pwm: 255,
             mode: ControlMode::Emergency,
+            override_cleared,
         };
     }
 
@@ -535,6 +589,7 @@ pub fn decide(
                 mode: ControlMode::Override {
                     expires_at_secs: exp,
                 },
+                override_cleared: false,
             };
         }
         Some(None) => {
@@ -583,6 +638,7 @@ pub fn decide(
     ControlDecision {
         intended_pwm: new_pwm,
         mode: ControlMode::Curve,
+        override_cleared: false,
     }
 }
 
@@ -771,11 +827,13 @@ pwm = 180
             slew_down_max: 20,
             hysteresis_c: 0, // disabled for clean slew test
         };
-        let latch = EmergencyLatch::new();
+        // Use i16::MAX as emergency_temp so the 200°C test temperature does not
+        // trigger the latch.
+        let mut latch = EmergencyLatch::new();
 
         // Up: last=50, temp gives target=200 → reach in ONE cycle.
         let mut ch = ChannelState::new(50);
-        let d = decide(Some(200), &mut ch, &config, &latch, 0);
+        let d = decide(Some(200), &mut ch, &config, &mut latch, i16::MAX, 0, 0);
         assert_eq!(
             d.intended_pwm, 200,
             "ramp up must reach target in one cycle"
@@ -786,7 +844,7 @@ pwm = 180
         let mut ch = ChannelState::new(200);
         let mut cycles = 0u32;
         loop {
-            let d = decide(Some(0), &mut ch, &config, &latch, 0);
+            let d = decide(Some(0), &mut ch, &config, &mut latch, i16::MAX, 0, 0);
             cycles += 1;
             if d.intended_pwm == 0 {
                 break;
@@ -818,11 +876,11 @@ pwm = 180
             slew_down_max: 100, // large enough to not interfere
             hysteresis_c: 5,
         };
-        let latch = EmergencyLatch::new();
+        let mut latch = EmergencyLatch::new();
         let mut ch = ChannelState::new(90);
 
         // Rise to 60°C → reference updates immediately, PWM increases.
-        let d = decide(Some(60), &mut ch, &config, &latch, 0);
+        let d = decide(Some(60), &mut ch, &config, &mut latch, 90, 80, 0);
         let pwm_60 = d.intended_pwm;
         assert!(
             pwm_60 > 90,
@@ -830,14 +888,14 @@ pwm = 180
         );
 
         // Drop 2°C to 58°C (drop < hysteresis=5): PWM must NOT decrease.
-        let d = decide(Some(58), &mut ch, &config, &latch, 0);
+        let d = decide(Some(58), &mut ch, &config, &mut latch, 90, 80, 0);
         assert_eq!(
             d.intended_pwm, pwm_60,
             "2°C drop inside 5°C deadband must not reduce PWM"
         );
 
         // Rise to 65°C: hysteresis must NOT delay the increase (ramp-up immediate).
-        let d = decide(Some(65), &mut ch, &config, &latch, 0);
+        let d = decide(Some(65), &mut ch, &config, &mut latch, 90, 80, 0);
         let pwm_65 = d.intended_pwm;
         assert!(
             pwm_65 > pwm_60,
@@ -846,14 +904,14 @@ pwm = 180
 
         // Drop exactly hysteresis_c (5°C) from 65 to 60: boundary — still inside deadband.
         // drop_threshold = 65 - 5 = 60; condition is temp < 60, so 60 is NOT < 60 → hold.
-        let d = decide(Some(60), &mut ch, &config, &latch, 0);
+        let d = decide(Some(60), &mut ch, &config, &mut latch, 90, 80, 0);
         assert_eq!(
             d.intended_pwm, pwm_65,
             "drop equal to hysteresis_c (boundary) must still hold"
         );
 
         // Drop 6°C to 59°C (> hysteresis=5 from reference 65): must allow reduction.
-        let d = decide(Some(59), &mut ch, &config, &latch, 0);
+        let d = decide(Some(59), &mut ch, &config, &mut latch, 90, 80, 0);
         assert!(
             d.intended_pwm < pwm_65,
             "6°C drop past deadband must reduce PWM"
@@ -868,50 +926,86 @@ pwm = 180
         let ch_cfg = cfg.pwm7.clone();
         let mut latch = EmergencyLatch::new();
         let mut ch = ChannelState::new(100);
+        let (et, rt) = (cfg.emergency_temp_c, cfg.emergency_release_c); // 90, 80
 
-        // At emergency_temp_c (90): latch activates, returns true once.
-        let activated = latch.update(90, cfg.emergency_temp_c, cfg.emergency_release_c);
-        assert!(activated, "latch must activate at emergency_temp_c");
+        // Latch must engage at emergency_temp (90°C): mode is Emergency.
+        let d = decide(Some(90), &mut ch, &ch_cfg, &mut latch, et, rt, 0);
+        assert_eq!(d.intended_pwm, 255);
+        assert_eq!(
+            d.mode,
+            ControlMode::Emergency,
+            "must latch at emergency_temp"
+        );
         assert!(latch.is_latched());
 
-        let d = decide(Some(90), &mut ch, &ch_cfg, &latch, 0);
-        assert_eq!(d.intended_pwm, 255);
-        assert_eq!(d.mode, ControlMode::Emergency);
+        // 85°C (between release=80 and emergency=90): must stay latched.
+        let d = decide(Some(85), &mut ch, &ch_cfg, &mut latch, et, rt, 1);
+        assert_eq!(d.mode, ControlMode::Emergency, "latch must hold at 85°C");
 
-        // At 85°C (between release=80 and emergency=90): must NOT release.
-        let newly = latch.update(85, cfg.emergency_temp_c, cfg.emergency_release_c);
-        assert!(!newly, "already latched — no new activation");
-        assert!(
-            latch.is_latched(),
-            "latch must hold at 85°C (above release threshold 80)"
-        );
-
-        // At 79°C (< release=80): must release.
-        latch.update(79, cfg.emergency_temp_c, cfg.emergency_release_c);
-        assert!(
-            !latch.is_latched(),
-            "latch must release below emergency_release_c"
-        );
+        // 79°C (< release=80): latch must release; curve resumes.
+        let _d = decide(Some(79), &mut ch, &ch_cfg, &mut latch, et, rt, 2);
+        assert!(!latch.is_latched(), "latch must release below release_temp");
 
         // After release, curve resumes.
-        let d = decide(Some(50), &mut ch, &ch_cfg, &latch, 0);
-        assert_ne!(
-            d.intended_pwm, 255,
-            "curve must resume after emergency release"
-        );
+        let d = decide(Some(50), &mut ch, &ch_cfg, &mut latch, et, rt, 3);
+        assert_ne!(d.intended_pwm, 255, "curve must resume after release");
         assert_eq!(d.mode, ControlMode::Curve);
 
-        // Emergency takes precedence over an active manual override.
-        let ov = Override::new(100, 600, 0).unwrap();
+        // A2 (strengthened): set an override with the MINIMUM valid PWM while NOT
+        // latched, then trigger the latch.  The override must be cleared on engagement
+        // so it cannot survive latch release into a hot state.
+        let ov = Override::new(EC_DUTY_FLOOR_35PCT, 600, 4).unwrap();
         ch.set_override(ov);
-        latch.update(90, cfg.emergency_temp_c, cfg.emergency_release_c); // re-latch
+        assert!(ch.active_override.is_some());
 
-        let d = decide(Some(90), &mut ch, &ch_cfg, &latch, 1);
+        // Latch engages at 95°C: override must be cleared, mode Emergency.
+        let d = decide(Some(95), &mut ch, &ch_cfg, &mut latch, et, rt, 4);
         assert_eq!(
-            d.intended_pwm, 255,
+            d.mode,
+            ControlMode::Emergency,
             "emergency must override manual override"
         );
-        assert_eq!(d.mode, ControlMode::Emergency);
+        assert_eq!(d.intended_pwm, 255);
+        assert!(
+            d.override_cleared,
+            "override_cleared must be true when latch engages with active override"
+        );
+        assert!(
+            ch.active_override.is_none(),
+            "active_override must be cleared from channel state on latch engagement"
+        );
+
+        // Latch releases at 79°C.
+        let _d = decide(Some(79), &mut ch, &ch_cfg, &mut latch, et, rt, 5);
+        assert!(!latch.is_latched());
+
+        // Post-release at 85°C: curve (255) must win, not stale override.
+        let d = decide(Some(85), &mut ch, &ch_cfg, &mut latch, et, rt, 6);
+        assert_eq!(
+            d.mode,
+            ControlMode::Curve,
+            "curve must control after latch release, not stale override"
+        );
+        // Default curve at 85°C: above last breakpoint (70°C→255), clamps to 255.
+        assert_eq!(
+            d.intended_pwm, 255,
+            "post-release at 85°C must use curve (255), not stale override floor"
+        );
+
+        // Emergency still takes precedence over a fresh override.
+        let ov2 = Override::new(200, 600, 7).unwrap();
+        ch.set_override(ov2);
+        let d = decide(Some(90), &mut ch, &ch_cfg, &mut latch, et, rt, 7);
+        assert_eq!(
+            d.mode,
+            ControlMode::Emergency,
+            "emergency must override a fresh manual override"
+        );
+        assert_eq!(d.intended_pwm, 255);
+        assert!(
+            d.override_cleared,
+            "override must be cleared when latch engages"
+        );
     }
 
     // ── R1e: failed sensor reading ─────────────────────────────────────────────
@@ -919,10 +1013,10 @@ pwm = 180
     #[test]
     fn r1e_failed_reading() {
         let config = default_pwm7();
-        let latch = EmergencyLatch::new();
+        let mut latch = EmergencyLatch::new();
         let mut ch = ChannelState::new(100);
 
-        let d = decide(None, &mut ch, &config, &latch, 0);
+        let d = decide(None, &mut ch, &config, &mut latch, 90, 80, 0);
         assert_eq!(d.intended_pwm, 255, "None temp must yield 255");
         assert_eq!(d.mode, ControlMode::FailSafe);
         // Channel state must also reflect 255 so daemon does not write stale value.
@@ -954,6 +1048,20 @@ pwm = 180
 
         let e = Override::new(200, u32::MAX, 0);
         assert!(e.is_err(), "ttl=u32::MAX must be rejected");
+
+        // A1 (strengthened): PWM below the 35% duty floor must be rejected regardless
+        // of TTL.  The 80–89°C range is unprotected by the emergency latch; a low
+        // override in that range would deliver dangerous airflow with no hardware recovery.
+        assert!(
+            Override::new(EC_DUTY_FLOOR_35PCT - 1, 600, 0).is_err(),
+            "pwm one below the duty floor must be rejected"
+        );
+        assert!(Override::new(0, 600, 0).is_err(), "pwm=0 must be rejected");
+        // The floor itself is accepted.
+        assert!(
+            Override::new(EC_DUTY_FLOOR_35PCT, 600, 0).is_ok(),
+            "pwm exactly at the duty floor must be accepted"
+        );
     }
 
     // ── R5b: override expiry ───────────────────────────────────────────────────
@@ -961,28 +1069,166 @@ pwm = 180
     #[test]
     fn r5b_override_expiry() {
         let config = default_pwm7();
-        let latch = EmergencyLatch::new();
+        let mut latch = EmergencyLatch::new();
         let mut ch = ChannelState::new(100);
 
-        // Override created at t=0 with ttl=600 expires at t=600.
-        let ov = Override::new(200, 600, 0).unwrap();
+        // Use the minimum-valid PWM at a hot temperature to prove that expiry
+        // actually hands control back to the curve rather than silently leaving
+        // fans at the duty floor.
+        let ov = Override::new(EC_DUTY_FLOOR_35PCT, 600, 0).unwrap();
         ch.set_override(ov);
 
-        // At t=599: still active.
-        let d = decide(Some(50), &mut ch, &config, &latch, 599);
-        assert_eq!(d.intended_pwm, 200, "override must be active before expiry");
+        // At t=599 and 85°C: override is active (EC_DUTY_FLOOR_35PCT), even
+        // though the curve at 85°C would give 255.
+        let d = decide(Some(85), &mut ch, &config, &mut latch, 90, 80, 599);
+        assert_eq!(
+            d.intended_pwm, EC_DUTY_FLOOR_35PCT,
+            "override must be active before expiry"
+        );
         assert!(
             matches!(d.mode, ControlMode::Override { .. }),
             "mode must be Override before expiry"
         );
 
-        // At t=600: expires (is_active uses strict <, so 600 is not < 600).
-        let d = decide(Some(50), &mut ch, &config, &latch, 600);
-        assert_ne!(d.intended_pwm, 200, "override must have expired at t=600");
+        // At t=600 and 85°C: override expires; curve resumes.
+        // Default curve at 85°C: above last breakpoint (70°C→255), clamps to 255.
+        // Ramp-up is immediate (last=EC_DUTY_FLOOR_35PCT, target=255 → 255 > 90).
+        let d = decide(Some(85), &mut ch, &config, &mut latch, 90, 80, 600);
+        assert_ne!(
+            d.intended_pwm, EC_DUTY_FLOOR_35PCT,
+            "override must have expired at t=600"
+        );
         assert_eq!(
             d.mode,
             ControlMode::Curve,
             "mode must return to Curve after override expiry"
+        );
+        assert_eq!(
+            d.intended_pwm, 255,
+            "post-expiry at 85°C must use curve (255), not leave fans at override floor"
+        );
+    }
+
+    // ── New tests: one per finding ─────────────────────────────────────────────
+
+    /// A1: Override::new must reject pwm below the 35% duty floor.
+    #[test]
+    fn a1_override_pwm_floor_rejected() {
+        // The emergency latch only fires at ≥90°C; the 80–89°C band has no
+        // latch protection, so an override at e.g. 10% duty at 85°C is a real hazard.
+        assert!(
+            Override::new(EC_DUTY_FLOOR_35PCT - 1, 600, 0).is_err(),
+            "pwm one below the floor must be rejected"
+        );
+        assert!(Override::new(0, 600, 0).is_err(), "pwm=0 must be rejected");
+        // The floor itself is accepted.
+        assert!(
+            Override::new(EC_DUTY_FLOOR_35PCT, 600, 0).is_ok(),
+            "pwm at the floor must be accepted"
+        );
+    }
+
+    /// A2: Override is cleared when the latch engages; post-release decide()
+    /// at 85°C returns the curve value (255), not the stale override floor.
+    #[test]
+    fn a2_override_cleared_on_latch_engagement() {
+        let ch_cfg = default_pwm7();
+        let mut latch = EmergencyLatch::new();
+        let mut ch = ChannelState::new(100);
+
+        // Set override at the minimum valid PWM while the latch is NOT engaged.
+        ch.set_override(Override::new(EC_DUTY_FLOOR_35PCT, 600, 0).unwrap());
+        assert!(ch.active_override.is_some());
+
+        // Latch engages at 95°C: override must be cleared, mode Emergency.
+        let d = decide(Some(95), &mut ch, &ch_cfg, &mut latch, 90, 80, 1);
+        assert_eq!(d.mode, ControlMode::Emergency);
+        assert_eq!(d.intended_pwm, 255);
+        assert!(
+            d.override_cleared,
+            "override_cleared must be set when latch engages with an active override"
+        );
+        assert!(
+            ch.active_override.is_none(),
+            "override must be absent from channel state after engagement"
+        );
+
+        // Latch releases at 79°C.
+        let _d = decide(Some(79), &mut ch, &ch_cfg, &mut latch, 90, 80, 2);
+        assert!(!latch.is_latched());
+
+        // Post-release at 85°C: curve (255) must control, not the cleared override.
+        let d = decide(Some(85), &mut ch, &ch_cfg, &mut latch, 90, 80, 3);
+        assert_eq!(
+            d.mode,
+            ControlMode::Curve,
+            "post-release must use curve, not stale override"
+        );
+        assert_eq!(
+            d.intended_pwm, 255,
+            "curve at 85°C (above last breakpoint 70°C→255) must give 255, not stale floor"
+        );
+    }
+
+    /// G1: Override::new with now_secs near u64::MAX must not panic.
+    #[test]
+    fn g1_override_new_no_overflow() {
+        // With saturating_add, now_secs + ttl_s saturates to u64::MAX instead of
+        // wrapping.  This must not panic in debug or release builds.
+        let result = Override::new(200, 3600, u64::MAX - 100);
+        assert!(result.is_ok(), "Override::new must not panic near u64::MAX");
+        // The override's expiry saturates to u64::MAX, keeping it active for all
+        // practical now_secs values.
+        let ov = result.unwrap();
+        assert!(
+            ov.is_active(u64::MAX - 50),
+            "saturated expiry must remain active"
+        );
+    }
+
+    /// E3: pwm_at() with empty breakpoints must return 255, not 0.
+    #[test]
+    fn e3_pwm_at_empty_breakpoints_returns_255() {
+        let config = ChannelConfig {
+            source: TempSource::CpuPackage,
+            breakpoints: vec![],
+            slew_down_max: 20,
+            hysteresis_c: 3,
+        };
+        // validate() also rejects empty breakpoints; this tests the pub API
+        // directly to confirm it fails safe rather than producing fans-off.
+        assert_eq!(
+            config.pwm_at(50),
+            255,
+            "empty breakpoints must return 255 (fail-safe), not 0"
+        );
+    }
+
+    /// B1: decide() on a fresh (never-updated) latch at 95°C must report Emergency.
+    #[test]
+    fn b1_decide_hot_start_reports_emergency() {
+        let ch_cfg = default_pwm7();
+        let mut latch = EmergencyLatch::new(); // never externally updated
+        let mut ch = ChannelState::new(100);
+        // decide() must call latch.update() internally before checking is_latched(),
+        // so the first call at 95°C correctly engages the latch.
+        let d = decide(Some(95), &mut ch, &ch_cfg, &mut latch, 90, 80, 0);
+        assert_eq!(
+            d.mode,
+            ControlMode::Emergency,
+            "first decide() at 95°C must report Emergency, not Curve"
+        );
+        assert_eq!(d.intended_pwm, 255);
+    }
+
+    /// D2: validate() must reject slew_down_max = 0.
+    #[test]
+    fn d2_slew_down_max_zero_rejected() {
+        let mut config = Config::default();
+        config.pwm7.slew_down_max = 0;
+        assert!(
+            config.validate().is_err(),
+            "slew_down_max = 0 must be rejected: fans could never ramp down"
         );
     }
 }

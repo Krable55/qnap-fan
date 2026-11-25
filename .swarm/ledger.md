@@ -22,13 +22,13 @@ Stable IDs. Never renumber; record approved changes instead.
 |---|---|---|---|---|---|
 | T1 | M0 scaffold: workspace, crates, config schema, CI skeleton | R8 (partial) | — | sonnet-4-6 | DONE, coord-verified |
 | T2 | M1 qfan-hal: hwmon discovery, sysfs + fake backends | R3, R9 | T1 | sonnet-4-6 | DONE, coord-verified (f5059e5) |
-| T3 | M2 qfan-core: curves, slew, hysteresis, overrides | R1, R5 (validation) | T1 | sonnet-4-6 | DONE, coord-verified (602af33); Opus review in flight |
+| T3 | M2 qfan-core: curves, slew, hysteresis, overrides | R1, R5 (validation) | T1 | sonnet-4-6 | DONE: all 7 review findings fixed, mutation-verified |
 | T4 | M3 control loop + failsafe + dry-run | R1, R2, R3 | T2, T3 | sonnet-4-6 | pending |
 | T5 | M4 qfan-hist | R4 | T1 | sonnet-4-6 | DONE, coord-verified (0632b4b) |
 | T6 | M5 socket API + status subcommand | R5 | T4, T5 | sonnet-4-6 | pending |
 | T7 | M6 ratatui TUI | R6 | T6 | sonnet-4-6 | pending |
 | T8 | M7 plugin packaging | R7, R2 (watchdog) | T4 | sonnet-4-6 | pending |
-| T9 | M8 release pipeline + M7 packaging | R7, R8, R2 | T1 | sonnet-4-6 | fix in progress (F10) |
+| T9 | M8 release pipeline + M7 packaging | R7, R8, R2 | T1 | sonnet-4-6 | DONE, coord-verified (729fbc5) |
 | T10 | M9 live cutover | R1, R2, R7 | all | coordinator | pending |
 
 ## Model routing
@@ -254,3 +254,127 @@ that tooling could not see:
 
 **Rule for remaining tasks:** verify at the boundary, in the units and the parser
 that production actually uses.
+
+## Opus 4.6 independent review of 602af33 — full text at review-findings.md
+
+Reviewer confirmed both prior fixes (clamp sweep, delivered-unit floor) are
+genuine and complete, then found 7 new findings. Coordinator independently
+reproduced the two criticals and E3:
+
+```
+A1: override 30 @85C -> pwm=30  mode=Override  (curve would be 255) = 10% delivered duty
+A2: while latched @95C -> pwm=255 mode=Emergency
+A2: after release @85C -> pwm=50 mode=Override  (curve would be 255)
+E3: pwm_at(50) with empty breakpoints = 0
+```
+
+| # | Sev | Finding | Status |
+|---|---|---|---|
+| A1 | CRITICAL | `Override::new` has no duty floor; `decide()` returns it verbatim. 80–89°C is unprotected because the latch has not engaged yet | reproduced |
+| A2 | CRITICAL | Override set while latched survives latch release into a hot state | reproduced |
+| G1 | HIGH | `Override::new` does `now_secs + ttl_s`; debug build panics and aborts the daemon | confirmed by reviewer probe |
+| B1 | MEDIUM | `decide()` reads `is_latched()` but nothing enforces that `update()` ran first; cold start at 95°C reports mode Curve, so no notification | confirmed |
+| E3 | MEDIUM | `pwm_at()` returns 0 for empty breakpoints and is `pub` | reproduced |
+| F2 | MEDIUM | Sweep starts at 80°C; `[{79,10},{80,90}]` is legal = 4% duty at 79°C | SUSPECTED, deferred to Q5 |
+| D2 | LOW | `slew_down_max == 0` blocks all ramp-down (errs safe) | confirmed |
+
+### Why my own earlier probe missed A1 (lesson)
+
+My T3 verification tested an override of **90** and saw the latch correctly beat
+it at 95°C, so I recorded overrides as safe. The hole is 80–89°C with a
+*sub-floor* override value. **Testing a safe value and generalising from it is not
+verification.** Probe the adversarial value, not the plausible one.
+
+### Test-quality finding — the most valuable part of the review
+
+Three existing tests would still pass if the property they claim to check were
+broken:
+
+- `r5b_override_expiry` — uses pwm 200, tests timing only, never a dangerous value
+- `r5a_override_ttl_validation` — never checks pwm bounds at all
+- `r1d_emergency_latch` — sets an override while latched but never exercises the
+  *release* path with a low override still active
+
+Green tests that cannot fail for the right reason. All three being strengthened
+alongside the fixes.
+
+## T9 verification completed
+
+- R7b **PASS** (was BLOCKED): `php -l` run on the NAS itself with php 8.4.23 —
+  the same interpreter that will serve the page. `No syntax errors detected`.
+- Required extensions present on the NAS: `sockets`, `json`.
+- Page audited against the R4 risk: **no** sysfs paths, **no** `exec`/`shell_exec`/
+  `system`/`popen`. Pure socket I/O, 2s timeout, honest "daemon not running" state.
+  Channel allowlist is `['pwm1','pwm7']`, so pwm21 is unreachable from the web UI.
+- F10 fix verified: `xmllint --noout` exits 0, entity refs intact, and both
+  `<INLINE>` blocks still pass `bash -n` after un-escaping `&amp;` back to `&`.
+
+## Q5 — open decision for the user (F2, the 79°C cliff)
+
+Sweep starts at 80°C, so a curve may legally deliver ~4% duty at 79°C. With the
+20°C-in-seconds transients in the crash logs, exposure is ~2-4s. Reviewer ruled
+out monotonic-PWM (the cliff is non-decreasing, so it would not help). Remaining
+options: lower the sweep floor to 75°C (rejects legitimate quiet-below-75 configs)
+or add a gradient check rejecting >100 PWM change across 1°C. Coordinator leans
+gradient check. Requires a deliberately adversarial config to trigger.
+
+## Safety fixes applied — all 7 review findings closed
+
+20 tests (14 original + 6 named for the findings). Coordinator re-probed every
+reproduction case against the fixed code:
+
+```
+A1: Override::new(30,..) = Err(PwmBelowFloor { pwm: 30, min: 90 })
+    floor 90 accepted, 89 rejected
+A2: @95C -> pwm=255 Emergency override_cleared=true
+    @79C release -> Curve;  @85C after release -> pwm=255 Curve (NOT the stale 100)
+G1: no panic at u64::MAX-100
+E3: pwm_at(50) with empty breakpoints = 255 (fails safe)
+B1: cold-start @95C -> pwm=255 mode=Emergency
+D2: slew_down_max=0 -> validate() rejects
+RAMP: 90 -> 255 in one cycle at 85C   <- ramp-up still immediate after all fixes
+```
+
+B1 was fixed structurally, not by convention: `decide()` now takes
+`&mut EmergencyLatch` plus the thresholds and calls `update()` itself, so a caller
+cannot evaluate a stale latch. It also returns `override_cleared` so the daemon
+can log the A2 clear.
+
+### MUTATION TESTING — the tests now fail for the right reasons
+
+The review's sharpest finding was that three tests would pass even if the property
+they claimed to check were broken. Fixing that claim required proving it, so each
+safety property was deliberately broken in the source and the suite re-run:
+
+| Mutation | Result |
+|---|---|
+| delete the A1 override duty-floor check | CAUGHT |
+| delete the A2 override-clear on latch engage | CAUGHT |
+| `saturating_add` -> `wrapping_add` at the G1 code site | CAUGHT |
+| empty-breakpoint return 255 -> 0 | CAUGHT |
+| hysteresis moved onto the PWM output instead of the temp signal | CAUGHT |
+| slew-limit applied to ramp UP as well | CAUGHT |
+
+7 of 7 caught (one earlier attempt was an invalid mutation that did not compile).
+
+**Two coordinator harness errors worth recording**, both of which initially
+reported a false "SURVIVED":
+1. Grepping for `FAILED` lines instead of checking the process exit code. A test
+   binary that ABORTS (`SIGABRT`, returncode 101) prints no `FAILED` line at all.
+   Check the exit code, not the log text.
+2. `str.replace(old, new, 1)` hit a *comment* mentioning `saturating_add` on line
+   395 rather than the code on line 397, so the "mutation" was a no-op and the
+   survival was meaningless. Anchor mutations on unique code text and assert the
+   mutated file actually differs in the intended place.
+
+Both are the same class as the F8/F9/F10 defects: the tool reported green because
+it was not measuring what it claimed to measure.
+
+## Full gate after fixes
+
+```
+qfan-core 20 passed | qfan-hal 20 passed | qfan-hist 9 passed
+clippy --all-targets -D warnings: 0 errors
+cargo fmt --check: OK
+cargo build -p qfan-hal: Finished (re-exports intact)
+```
