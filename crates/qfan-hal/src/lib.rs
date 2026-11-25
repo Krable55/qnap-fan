@@ -135,48 +135,15 @@ impl TempSensor {
 }
 
 // ── PWM rounding (§2.3) ──────────────────────────────────────────────────────
-
-/// EC PWM rounding: the hardware stores duty as whole percent and reads back
-/// the reconverted value.
-///
-/// - Write 180 → stored as 70% → read back **178**
-/// - Write 73  → stored as 28% → read back **71**
-///
-/// The daemon must compare against its own last-intended value, never read-back,
-/// to avoid an infinite rewrite loop (§2.3). [`FakeBackend`] applies this same
-/// rounding on [`EcBackend::write_pwm`] so T4 can test the guard correctly.
-pub const fn ec_pwm_round(written: u8) -> u8 {
-    let pct = written as u32 * 100 / 255;
-    (pct * 255 / 100) as u8
-}
-
-/// Smallest value you can WRITE such that `ec_pwm_round(written) >= delivered_floor`.
-///
-/// The EC rounds PWM to whole percent before delivering it, so writing the raw
-/// floor value is not sufficient: `ec_pwm_round(89) == 86`, which is below the
-/// 35% duty limit. Use this function when enforcing a guaranteed delivered duty.
-///
-/// Returns `delivered_floor` itself when rounding is a no-op for that value,
-/// and 255 when no value in 0..=255 satisfies the constraint (saturates).
-pub const fn ec_pwm_min_write_for(delivered_floor: u8) -> u8 {
-    let mut w = 0u8;
-    loop {
-        if ec_pwm_round(w) >= delivered_floor {
-            return w;
-        }
-        if w == 255 {
-            return 255;
-        }
-        w += 1;
-    }
-}
-
-/// Smallest WRITE value that delivers at least 35% duty (≥ 89 after EC rounding).
-///
-/// `ec_pwm_round(89) == 86` (33% duty), so the raw qfan-core floor of 89 is
-/// not safe to pass directly to `write_pwm`. Write at least this constant instead.
-/// qfan-core's curve validator must be updated to enforce this composed floor.
-pub const EC_DUTY_FLOOR_35PCT: u8 = ec_pwm_min_write_for(89);
+// ── EC PWM rounding ───────────────────────────────────────────────────────────
+//
+// The rounding model and the delivered-duty floor live in qfan-core as pure
+// arithmetic, so the curve validator can enforce the floor in DELIVERED units
+// without qfan-hal depending on it (that would invert the layering). They are
+// re-exported here because this is the crate that actually talks to the EC.
+pub use qfan_core::{
+    ec_pwm_min_write_for, ec_pwm_round, DELIVERED_DUTY_FLOOR, EC_DUTY_FLOOR_35PCT,
+};
 
 // ── Backend trait (object-safe) ───────────────────────────────────────────────
 
