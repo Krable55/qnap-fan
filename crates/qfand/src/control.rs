@@ -146,6 +146,10 @@ pub struct LoopState {
     // CPU package temp ring buffer for 30 s trailing max (T0, deci-°C values)
     pkg_ring: RingBuffer,
 
+    /// History writer (F17). `HistoryWriter::disabled()` in dry-run and tests,
+    /// so the record call site needs no branching.
+    hist: crate::history::HistoryWriter,
+
     // Latest sensor readings
     disk_temps: Vec<(String, Option<i16>)>,
     fan_rpms: HashMap<FanChannel, Option<u32>>,
@@ -164,6 +168,16 @@ pub struct LoopState {
 
 impl LoopState {
     pub fn new(config: &Config, dry_run: bool) -> Self {
+        Self::with_history(config, dry_run, crate::history::HistoryWriter::disabled())
+    }
+
+    /// Construct with a history writer. Dry-run deliberately keeps the disabled
+    /// writer: a validation run must not mutate a year of recorded history.
+    pub fn with_history(
+        config: &Config,
+        dry_run: bool,
+        hist: crate::history::HistoryWriter,
+    ) -> Self {
         let fan_every = (config.poll_ec_fan_s / config.poll_coretemp_s).max(1) as u64;
         let disk_every = (config.poll_disks_s / config.poll_coretemp_s).max(1) as u64;
         Self {
@@ -177,6 +191,7 @@ impl LoopState {
             last_written_pwm7: 255,
             last_written_pwm1: 255,
             pkg_ring: RingBuffer::new(Series::CpuPackage, 1800),
+            hist,
             disk_temps: Vec::new(),
             fan_rpms: HashMap::new(),
             fan_every_ticks: fan_every,
@@ -185,6 +200,54 @@ impl LoopState {
             emergency_notified: false,
             dry_run,
             disks_ini_path: DISKS_INI_PATH.to_owned(),
+        }
+    }
+
+    /// Queue every series for this tick. Values are deci-units throughout, so
+    /// no scaling happens here — the sensor read and the stored slot share a
+    /// unit, which is what keeps `i16::MIN` usable as the no-data sentinel.
+    fn record_history(
+        &self,
+        now: u64,
+        pkg_deci: Option<i16>,
+        core_temps: &[Option<i16>],
+        pwm7: u8,
+        pwm1: u8,
+    ) {
+        use qfan_hist::Unit;
+
+        if let Some(v) = pkg_deci {
+            self.hist
+                .record(Series::CpuPackage, Unit::DeciCelsius, v, now);
+        }
+        for (i, t) in core_temps.iter().enumerate() {
+            if let Some(v) = *t {
+                self.hist
+                    .record(Series::CpuCore(i as u8), Unit::DeciCelsius, v, now);
+            }
+        }
+        for (name, t) in &self.disk_temps {
+            if let Some(v) = *t {
+                self.hist
+                    .record(Series::Disk(name.clone()), Unit::DeciCelsius, v, now);
+            }
+        }
+        // PWM is stored in raw 0-255 units, matching what the EC was told.
+        self.hist
+            .record(Series::Pwm(7), Unit::Pwm, pwm7 as i16, now);
+        self.hist
+            .record(Series::Pwm(1), Unit::Pwm, pwm1 as i16, now);
+
+        for (ch, rpm) in &self.fan_rpms {
+            if let Some(r) = *rpm {
+                let n = fan_channel_number(*ch);
+                self.hist.record(
+                    Series::Fan(n),
+                    Unit::Rpm,
+                    r.min(i16::MAX as u32) as i16,
+                    now,
+                );
+            }
         }
     }
 
@@ -344,6 +407,19 @@ impl LoopState {
         self.maybe_write(backend, PwmChannel::Pwm7, dec7.intended_pwm, &reason7);
         self.maybe_write(backend, PwmChannel::Pwm1, dec1.intended_pwm, &reason1);
 
+        // ── Record history (F17) ───────────────────────────────────────────────
+        // Queued to a writer thread; never touches storage on this thread. The
+        // sample rate here is the control tick, and qfan_hist aggregates
+        // in-place per bucket, so the minute and hour tiers derive from the
+        // same stream without a separate rollup pass.
+        self.record_history(
+            now,
+            pkg_deci,
+            &core_temps,
+            dec7.intended_pwm,
+            dec1.intended_pwm,
+        );
+
         // ── Publish snapshot for socket clients (outside any lock during EC ops) ──
         // Capture values before the publish closure so the closure has minimal size.
         let pub_pkg = pkg_deci;
@@ -440,12 +516,26 @@ impl LoopState {
 /// Creates a `FailsafeGuard` on entry — it sets pwm1=pwm7=255 on any exit
 /// path including panic unwind (R2). Called from `run_daemon` via
 /// `tokio::task::spawn_blocking`.
+/// Map a fan channel to the number used in its series name (`fan.7`).
+/// R6: only the six driven fans are representable; fan22-35 have no variant.
+fn fan_channel_number(ch: FanChannel) -> u8 {
+    match ch {
+        FanChannel::Fan1 => 1,
+        FanChannel::Fan2 => 2,
+        FanChannel::Fan3 => 3,
+        FanChannel::Fan4 => 4,
+        FanChannel::Fan7 => 7,
+        FanChannel::Fan8 => 8,
+    }
+}
+
 pub fn run_loop(
     backend: Arc<dyn EcBackend>,
     config: Config,
     shared: Shared,
     dry_run: bool,
     stop: Arc<std::sync::atomic::AtomicBool>,
+    hist: crate::history::HistoryWriter,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -453,7 +543,7 @@ pub fn run_loop(
     let _guard = FailsafeGuard::new(Arc::clone(&backend), dry_run);
 
     let interval = Duration::from_secs(config.poll_coretemp_s as u64);
-    let mut state = LoopState::new(&config, dry_run);
+    let mut state = LoopState::with_history(&config, dry_run, hist);
 
     // Start at 255 immediately (failsafe until first tick completes)
     if !dry_run {

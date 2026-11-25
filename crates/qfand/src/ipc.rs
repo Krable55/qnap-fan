@@ -6,7 +6,7 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -30,12 +30,34 @@ const MAX_LINE_BYTES: usize = 65_536;
 #[derive(Clone)]
 pub struct ServerCtx {
     pub shared: Shared,
-    /// Snapshot of the daemon config; used for `{"op":"config"}` and
-    /// to preserve source/slew/hysteresis when only breakpoints are changed.
-    pub config: Arc<Config>,
-    /// Root directory for T1/T2 history `.qfrb` files.
-    /// Structure: `<hist_base>/<tier>/<series>.qfrb`.
-    pub hist_base: PathBuf,
+    /// The daemon's live config: what `{"op":"config"}` reports, and the base
+    /// a `set_curve` is validated against. Updated only when a curve is
+    /// accepted, so clients (the TUI curve editor) can load the running curve.
+    pub config: Arc<Mutex<Config>>,
+    /// Where accepted curves are saved so they survive a restart. `None` in
+    /// dry-run and tests: the curve still applies, nothing is written.
+    pub config_path: Option<PathBuf>,
+    /// Root directory for the HOUR tier (flash).
+    /// Structure: `<hist_hour_base>/hour/<series>.qfrb`.
+    pub hist_hour_base: PathBuf,
+    /// Root directory for the MINUTE tier (appdata), or `None` when appdata is
+    /// not mounted. The two tiers have DIFFERENT roots by design (D2), so a
+    /// single `hist_base` would resolve `tier=minute` under the flash root and
+    /// return empty forever — the F17 failure mode, reintroduced one layer up.
+    pub hist_minute_base: Option<PathBuf>,
+}
+
+impl ServerCtx {
+    /// Resolve the directory holding a tier's files, or `None` if that tier is
+    /// not currently stored anywhere.
+    fn tier_base(&self, tier: Tier) -> Option<&Path> {
+        match tier {
+            Tier::Hour => Some(self.hist_hour_base.as_path()),
+            Tier::Minute => self.hist_minute_base.as_deref(),
+            // T0 is an in-process RAM ring; it has no files.
+            Tier::Raw => None,
+        }
+    }
 }
 
 /// Bind the socket, set permissions 0660, and accept clients in a loop.
@@ -250,7 +272,8 @@ fn handle_status(ctx: &ServerCtx) -> Response {
 }
 
 fn handle_config(ctx: &ServerCtx) -> Response {
-    match serde_json::to_value(ctx.config.as_ref()) {
+    let live = ctx.config.lock().unwrap_or_else(PoisonError::into_inner);
+    match serde_json::to_value(&*live) {
         Ok(v) => Response::Config(v),
         Err(e) => Response::Ack(Ack::Error {
             message: format!("config serialisation: {e}"),
@@ -274,7 +297,19 @@ async fn handle_history(
         }
     };
 
-    let path = ctx.hist_base.join(&tier).join(format!("{series}.qfrb"));
+    let Some(base) = ctx.tier_base(tier_enum) else {
+        // Not an error: the raw tier is RAM-only, and the minute tier is absent
+        // until appdata mounts. An empty series is the honest answer, and the
+        // gap sentinel keeps a client from drawing it as 0.
+        return Response::History(HistoryResponse {
+            series,
+            tier,
+            slots: vec![],
+        });
+    };
+    let path = base
+        .join(crate::history::tier_dir(tier_enum))
+        .join(format!("{series}.qfrb"));
     let series_ret = series.clone();
     let tier_ret = tier.clone();
 
@@ -338,26 +373,61 @@ async fn handle_history(
     }
 }
 
+/// Validate, save, then apply a curve, in that order, and answer only once
+/// the outcome is known.
+///
+/// Validation used to happen later, in the control loop, after this handler had
+/// already answered `ok`: a rejected curve looked accepted to every client and
+/// the reason went only to the daemon log. The control loop still re-validates
+/// (defence in depth); with identical inputs it reaches the same verdict.
+///
+/// Saving comes before applying so the running curve and the file the next
+/// start loads never disagree. A curve that cannot be saved is not applied.
 fn handle_set_curve(
     ctx: &ServerCtx,
     channel: String,
     points: Vec<qfan_core::CurvePoint>,
 ) -> Response {
-    // Preserve source/slew/hysteresis from the current config; only replace breakpoints.
-    let base = match channel.as_str() {
-        "pwm7" => ctx.config.pwm7.clone(),
-        "pwm1" => ctx.config.pwm1.clone(),
+    // Held across validate -> save -> apply so two clients cannot interleave
+    // and leave the file and the running curve describing different curves.
+    let mut live = ctx.config.lock().unwrap_or_else(PoisonError::into_inner);
+
+    // Preserve source/slew/hysteresis; only the breakpoints change.
+    let mut candidate = live.clone();
+    let slot = match channel.as_str() {
+        "pwm7" => &mut candidate.pwm7,
+        "pwm1" => &mut candidate.pwm1,
         _ => {
             return Response::Ack(Ack::Error {
                 message: format!("unknown channel {channel:?}; use pwm1 or pwm7"),
             })
         }
     };
-    let config = qfan_core::ChannelConfig {
-        breakpoints: points,
-        ..base
-    };
-    ctx.shared.submit(Command::SetCurve { channel, config });
+    slot.breakpoints = points;
+    let new_cfg = slot.clone();
+
+    if let Err(e) = candidate.validate() {
+        return Response::Ack(Ack::Error {
+            message: format!("curve rejected: {e}"),
+        });
+    }
+
+    match &ctx.config_path {
+        Some(path) => {
+            if let Err(e) = crate::config_file::save_curve(path, &channel, &new_cfg) {
+                return Response::Ack(Ack::Error {
+                    message: format!("curve not applied: could not save it: {e:#}"),
+                });
+            }
+        }
+        None => eprintln!("[qfand] {channel} curve applied in memory only (dry-run: not saved)"),
+    }
+
+    *live = candidate;
+    ctx.shared.submit(Command::SetCurve {
+        channel,
+        config: new_cfg,
+    });
     Response::Ack(Ack::Ok)
 }
 
@@ -441,8 +511,10 @@ mod tests {
     fn test_ctx(dir: &TempDir) -> ServerCtx {
         ServerCtx {
             shared: Shared::new(false, 0),
-            config: Arc::new(Config::default()),
-            hist_base: dir.path().to_path_buf(),
+            config: Arc::new(Mutex::new(Config::default())),
+            config_path: None,
+            hist_hour_base: dir.path().to_path_buf(),
+            hist_minute_base: Some(dir.path().to_path_buf()),
         }
     }
 
@@ -463,6 +535,70 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         (sock, ctx)
+    }
+
+    /// F17 end-to-end: the control loop's history WRITER and the socket
+    /// READER must agree on paths. Both sides passed their own tests while the
+    /// daemon recorded nothing for a year of intended retention, because
+    /// nothing exercised the seam. This test owns that seam: it records through
+    /// the real `HistoryWriter`, then queries over the real socket.
+    #[tokio::test]
+    async fn history_written_by_the_writer_is_served_by_the_socket() {
+        let dir = TempDir::new().unwrap();
+        let (sock, _ctx) = start_server(&dir).await;
+
+        // Write via the production writer, pointed at the server's roots.
+        let paths = crate::history::HistoryPaths {
+            hour_base: dir.path().to_path_buf(),
+            minute_base: Some(dir.path().to_path_buf()),
+        };
+        let (w, handle) = crate::history::spawn(paths);
+        let t = 1_700_000_000u64;
+        w.record(qfan_core::Series::CpuPackage, Unit::DeciCelsius, 571, t);
+        drop(w);
+        // join() is blocking; on the single-threaded test runtime calling it
+        // directly deadlocks the executor. Hand it to the blocking pool.
+        tokio::task::spawn_blocking(move || handle.join().unwrap())
+            .await
+            .unwrap();
+
+        // Read back over the socket, for both file-backed tiers. The range must
+        // be realistic: handle_history visits every bucket in it, and 0..10^10
+        // is ~166 million minute buckets, which spun this test for 10+ minutes.
+        let (from, to) = (t - 7200, t + 7200);
+        for tier in ["hour", "minute"] {
+            let req = format!(
+                r#"{{"op":"history","series":"cpu.package","tier":"{tier}","from":{from},"to":{to}}}"#
+            );
+            let resp = send_recv(&sock, &req).await;
+            assert!(
+                resp.contains("571"),
+                "tier {tier}: writer stored 571 but the socket returned: {resp}"
+            );
+            assert!(
+                !resp.contains(r#""slots":[]"#),
+                "tier {tier}: socket returned an empty series — the F17 bug, \
+                 where the API answers correctly and the data is elsewhere: {resp}"
+            );
+        }
+    }
+
+    /// The raw tier is a RAM ring with no files. It must answer empty rather
+    /// than erroring or inventing a path.
+    #[tokio::test]
+    async fn raw_tier_has_no_files_and_answers_empty() {
+        let dir = TempDir::new().unwrap();
+        let (sock, _ctx) = start_server(&dir).await;
+        let resp = send_recv(
+            &sock,
+            r#"{"op":"history","series":"cpu.package","tier":"raw","from":0,"to":9999999999}"#,
+        )
+        .await;
+        assert!(
+            resp.contains(r#""slots":[]"#),
+            "raw tier must be empty: {resp}"
+        );
+        assert!(!resp.contains("error"), "raw tier is not an error: {resp}");
     }
 
     /// Connect, send one request, return the raw response line.
@@ -540,6 +676,119 @@ mod tests {
         let resp = send_recv(&sock, &req).await;
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["result"], "ok");
+    }
+
+    fn set_curve_req(channel: &str, points: serde_json::Value) -> String {
+        serde_json::json!({"op": "set_curve", "channel": channel, "points": points}).to_string()
+    }
+
+    /// An unsafe curve must be refused in the reply itself. The handler used to
+    /// answer `ok` and leave validation to the control loop, so the TUI showed
+    /// success while the daemon logged the rejection and kept the old curve.
+    #[tokio::test]
+    async fn unsafe_curve_is_rejected_in_the_reply() {
+        let dir = TempDir::new().unwrap();
+        let (sock, ctx) = start_server(&dir).await;
+        // 60 PWM at 80 °C is below the 35% delivered-duty floor.
+        let req = set_curve_req(
+            "pwm7",
+            serde_json::json!([{"temp_c": 45, "pwm": 60}, {"temp_c": 80, "pwm": 60}]),
+        );
+
+        let v: serde_json::Value = serde_json::from_str(&send_recv(&sock, &req).await).unwrap();
+
+        assert_eq!(v["result"], "error", "{v}");
+        assert!(
+            v["message"].as_str().unwrap().contains("35%"),
+            "reason reaches the client: {v}"
+        );
+        let live = ctx.config.lock().unwrap();
+        assert_eq!(
+            live.pwm7.breakpoints,
+            Config::default().pwm7.breakpoints,
+            "running curve untouched"
+        );
+        assert!(
+            ctx.shared.drain().is_empty(),
+            "nothing queued for the control loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn out_of_order_points_are_rejected_in_the_reply() {
+        let dir = TempDir::new().unwrap();
+        let (sock, _ctx) = start_server(&dir).await;
+        let req = set_curve_req(
+            "pwm7",
+            serde_json::json!([{"temp_c": 70, "pwm": 255}, {"temp_c": 45, "pwm": 90}]),
+        );
+        let v: serde_json::Value = serde_json::from_str(&send_recv(&sock, &req).await).unwrap();
+        assert_eq!(v["result"], "error", "{v}");
+        assert!(v["message"].as_str().unwrap().contains("monotonic"), "{v}");
+    }
+
+    /// The TUI editor loads the running curve from `{"op":"config"}`. That op
+    /// used to return the startup snapshot forever, so it must reflect an
+    /// accepted curve immediately.
+    #[tokio::test]
+    async fn config_op_reports_the_accepted_curve() {
+        let dir = TempDir::new().unwrap();
+        let (sock, _ctx) = start_server(&dir).await;
+        let pts = serde_json::json!([{"temp_c": 50, "pwm": 100}, {"temp_c": 72, "pwm": 255}]);
+        let ack = send_recv(&sock, &set_curve_req("pwm7", pts.clone())).await;
+        assert!(ack.contains(r#""result":"ok""#), "{ack}");
+
+        let v: serde_json::Value =
+            serde_json::from_str(&send_recv(&sock, r#"{"op":"config"}"#).await).unwrap();
+
+        assert_eq!(v["pwm7"]["breakpoints"], pts);
+        assert_eq!(
+            v["pwm1"]["breakpoints"],
+            serde_json::to_value(Config::default().pwm1.breakpoints).unwrap()
+        );
+    }
+
+    /// An accepted curve is written to the config file, so a restart keeps it.
+    /// A rejected one leaves the file alone.
+    #[tokio::test]
+    async fn accepted_curve_is_saved_and_rejected_one_is_not() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, include_str!("../../../plugin/config.default.toml")).unwrap();
+        let sock = dir.path().join("save.sock");
+        let ctx = ServerCtx {
+            config_path: Some(path.clone()),
+            ..test_ctx(&dir)
+        };
+        let ctx2 = ctx.clone();
+        let sock2 = sock.clone();
+        tokio::spawn(async move { serve(ctx2, &sock2).await.ok() });
+        for _ in 0..50 {
+            if sock.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let good = serde_json::json!([{"temp_c": 30, "pwm": 90}, {"temp_c": 55, "pwm": 200}]);
+        let ack = send_recv(&sock, &set_curve_req("pwm1", good)).await;
+        assert!(ack.contains(r#""result":"ok""#), "{ack}");
+        let saved = Config::load(&path).unwrap();
+        assert_eq!(
+            saved.pwm1.breakpoints,
+            ctx.config.lock().unwrap().pwm1.breakpoints
+        );
+        assert_eq!(saved.pwm1.breakpoints[1].pwm, 200);
+
+        let before = std::fs::read_to_string(&path).unwrap();
+        let bad = serde_json::json!([{"temp_c": 30, "pwm": 10}, {"temp_c": 90, "pwm": 10}]);
+        let ack = send_recv(&sock, &set_curve_req("pwm1", bad)).await;
+        assert!(ack.contains(r#""result":"error""#), "{ack}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "rejected curve not saved"
+        );
     }
 
     #[tokio::test]

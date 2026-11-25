@@ -7,7 +7,9 @@
 // state.rs and ipc.rs items become live once run_daemon is implemented.
 #![allow(dead_code)]
 
+mod config_file;
 mod control;
+mod history;
 mod ipc;
 mod state;
 mod tui;
@@ -120,21 +122,47 @@ async fn run_daemon(config_path: &Path, dry_run: bool) -> Result<()> {
     // stop flag: set true to terminate the control loop
     let stop = Arc::new(AtomicBool::new(false));
 
+    // History writer (F17). Dry-run gets a disabled writer: a validation run
+    // must not mutate recorded history. The writer owns its own thread so a
+    // spun-down cache pool cannot stall the control loop (F6 budget).
+    let hist_paths = history::HistoryPaths::production();
+    let hist_hour_base = hist_paths.hour_base.clone();
+    let hist_minute_base = hist_paths.minute_base.clone();
+    if hist_paths.minute_base.is_none() {
+        eprintln!(
+            "[qfand] appdata not present; recording the hour tier only \
+             (minute tier resumes on next start once appdata is mounted)"
+        );
+    }
+    let (hist_writer, hist_handle) = if dry_run {
+        (history::HistoryWriter::disabled(), None)
+    } else {
+        let (w, h) = history::spawn(hist_paths);
+        (w, Some(h))
+    };
+
     // Synchronous control loop on a blocking thread (R1: sole EC writer)
     let backend2 = Arc::clone(&backend);
     let shared2 = shared.clone();
     let config2 = config.clone();
     let stop2 = Arc::clone(&stop);
+    let hist2 = hist_writer.clone();
     let loop_handle = tokio::task::spawn_blocking(move || {
-        control::run_loop(backend2, config2, shared2, dry_run, stop2);
+        control::run_loop(backend2, config2, shared2, dry_run, stop2, hist2);
     });
 
-    // Socket server (pure reader — never writes PWM, never calls decide)
-    let hist_base = PathBuf::from("/var/lib/qnap-fan/history");
+    // Socket server (pure reader — never writes PWM, never calls decide).
+    // Reads from the SAME root the writer uses: a mismatch here is exactly the
+    // F17 failure (API answers, files are elsewhere), so it is derived, not
+    // written out a second time.
     let sock_ctx = ipc::ServerCtx {
         shared: shared.clone(),
-        config: Arc::new(config),
-        hist_base,
+        config: Arc::new(std::sync::Mutex::new(config)),
+        // Dry-run must not rewrite the operator's config file; accepted curves
+        // still apply in memory so the run exercises the same path.
+        config_path: (!dry_run).then(|| config_path.to_path_buf()),
+        hist_hour_base,
+        hist_minute_base,
     };
     tokio::spawn(async move {
         if let Err(e) = ipc::serve(sock_ctx, std::path::Path::new(ipc::SOCK_PATH)).await {
@@ -159,6 +187,15 @@ async fn run_daemon(config_path: &Path, dry_run: bool) -> Result<()> {
     // Signal control loop to stop, then wait for it (FailsafeGuard fires on exit)
     stop.store(true, Ordering::Relaxed);
     let _ = loop_handle.await;
+
+    // Drop the writer handle so the channel closes, then let the thread drain
+    // its queue. Without this the final samples are discarded on every clean
+    // restart — a small permanent hole in the history at exactly the moments
+    // an operator is most likely to be looking at it.
+    drop(hist_writer);
+    if let Some(h) = hist_handle {
+        let _ = h.join();
+    }
 
     Ok(())
 }

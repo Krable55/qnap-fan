@@ -88,7 +88,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             $post_result = ['ok' => false, 'msg' => 'Invalid channel or points.'];
         } else {
             $resp = daemon_query(['op' => 'set_curve', 'channel' => $channel, 'points' => $points]);
-            $post_result = $resp ?? ['ok' => false, 'msg' => 'No response from daemon.'];
+            // The daemon answers {"result":"ok"} or {"result":"error","message":…}.
+            // Reading 'ok'/'msg' straight off that reply reported every
+            // accepted curve as "Error: unknown".
+            $post_result = $resp === null
+                ? ['ok' => false, 'msg' => 'No response from daemon.']
+                : ['ok' => ($resp['result'] ?? '') === 'ok',
+                   'msg' => $resp['message'] ?? 'unexpected reply from daemon'];
         }
     } else {
         $post_result = ['ok' => false, 'msg' => 'Unknown action.'];
@@ -142,7 +148,7 @@ function pwm_pct(?int $pwm): string {
 
 <?php if ($post_result !== null): ?>
   <?php if ($post_result['ok'] ?? false): ?>
-    <div class="ok-box">Curve updated successfully.</div>
+    <div class="ok-box">Curve applied and saved to config.toml.</div>
   <?php else: ?>
     <div class="err-box">Error: <?= htmlspecialchars($post_result['msg'] ?? 'unknown') ?></div>
   <?php endif; ?>

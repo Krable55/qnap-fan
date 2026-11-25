@@ -93,11 +93,41 @@ pub enum Ack {
 }
 
 /// Top-level response enum covering all op types.
+///
+/// Untagged: serde decodes into the FIRST variant that fits. `Config` holds a
+/// bare `Value` and fits anything, so it must stay last.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Response {
     Status(StatusResponse),
     History(HistoryResponse),
-    Config(serde_json::Value),
     Ack(Ack),
+    Config(serde_json::Value),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Response` is untagged, so serde takes the first variant that fits.
+    /// `Config(Value)` fits any JSON at all; while it was listed before `Ack`,
+    /// every ack decoded as `Config` and clients matching `Response::Ack`
+    /// never saw an accept or a rejection.
+    #[test]
+    fn acks_decode_as_acks() {
+        let ok: Response = serde_json::from_str(r#"{"result":"ok"}"#).unwrap();
+        assert!(matches!(ok, Response::Ack(Ack::Ok)), "{ok:?}");
+
+        let err: Response = serde_json::from_str(r#"{"result":"error","message":"nope"}"#).unwrap();
+        assert!(
+            matches!(&err, Response::Ack(Ack::Error { message }) if message == "nope"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn config_still_decodes_as_config() {
+        let v: Response = serde_json::from_str(r#"{"pwm7":{"breakpoints":[]}}"#).unwrap();
+        assert!(matches!(v, Response::Config(_)), "{v:?}");
+    }
 }

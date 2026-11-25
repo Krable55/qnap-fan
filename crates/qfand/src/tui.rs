@@ -136,7 +136,16 @@ pub(crate) struct AppState {
     pub crv_editing: bool,
     pub crv_buf: String,
     pub crv_error: Option<String>,
+    pub crv_ok: Option<String>,
     pub crv_submit: bool,
+    /// The points on screen came from the daemon's running config. Until they
+    /// have, editing and submit are disabled: the editor used to open on
+    /// hardcoded pwm7 defaults, and submitting those on pwm1 replaced the real
+    /// pwm1 curve with pwm7's.
+    pub crv_loaded: bool,
+    /// Fetch the running curve for `crv_channel` on the next loop iteration.
+    pub crv_reload: bool,
+    pub crv_load_error: Option<String>,
 
     // Override tab
     pub ov_channel: usize, // 0=pwm1, 1=pwm7
@@ -162,22 +171,17 @@ impl Default for AppState {
             hist_data: vec![],
 
             crv_channel: 1,
-            crv_points: vec![
-                CurvePoint {
-                    temp_c: 45,
-                    pwm: 90,
-                },
-                CurvePoint {
-                    temp_c: 70,
-                    pwm: 255,
-                },
-            ],
+            crv_points: vec![],
             crv_sel: 0,
             crv_field: 0,
             crv_editing: false,
             crv_buf: String::new(),
             crv_error: None,
+            crv_ok: None,
             crv_submit: false,
+            crv_loaded: false,
+            crv_reload: true,
+            crv_load_error: None,
 
             ov_channel: 1,
             ov_pwm_buf: String::new(),
@@ -192,6 +196,24 @@ impl Default for AppState {
 }
 
 impl AppState {
+    /// Drop local edits and fetch `crv_channel`'s running curve.
+    fn crv_request_reload(&mut self) {
+        self.crv_points.clear();
+        self.crv_sel = 0;
+        self.crv_loaded = false;
+        self.crv_reload = true;
+        self.crv_error = None;
+        self.crv_ok = None;
+    }
+
+    /// Install a curve fetched from the daemon.
+    fn crv_apply_loaded(&mut self, points: Vec<CurvePoint>) {
+        self.crv_sel = self.crv_sel.min(points.len().saturating_sub(1));
+        self.crv_points = points;
+        self.crv_loaded = !self.crv_points.is_empty();
+        self.crv_load_error = None;
+    }
+
     fn crv_channel_name(&self) -> &'static str {
         if self.crv_channel == 0 {
             "pwm1"
@@ -417,9 +439,9 @@ fn draw_help(f: &mut Frame, area: Rect, app: &AppState) {
         Tab::Dashboard => "[1-4/Tab] switch  [q/Esc] quit",
         Tab::History => "[h/l] window  [j/k] series  [q] quit",
         Tab::Curves => {
-            "[j/k] nav  [Tab] field  [Enter] edit  [a] add  [d] del  [c] chan  [s] submit"
+            "[j/k] row  [Tab/h/l] column  [Enter] edit  [a] add  [d] del  [s] apply  [r] reload  [c] chan  [1-4] tabs"
         }
-        Tab::Override => "[Tab] field  [s] set  [x] clear  [c] channel  [q] quit",
+        Tab::Override => "[Tab] field  [s] set  [x] clear  [c] channel  [1-4] tabs  [q] quit",
     };
     f.render_widget(
         Paragraph::new(txt).style(Style::default().fg(Color::DarkGray)),
@@ -703,6 +725,23 @@ fn draw_curves(f: &mut Frame, area: Rect, app: &AppState) {
     let title = format!("Curve Editor — {channel}");
 
     let mut lines: Vec<Line> = vec![];
+    if !app.crv_loaded {
+        let msg = match &app.crv_load_error {
+            Some(e) => format!("Cannot load the {channel} curve from the daemon: {e}"),
+            None => format!("Loading the {channel} curve from the daemon…"),
+        };
+        lines.push(Line::from(Span::styled(
+            msg,
+            Style::default().fg(Color::DarkGray),
+        )));
+        f.render_widget(
+            Paragraph::new(lines)
+                .block(Block::default().borders(Borders::ALL).title(title))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+        return;
+    }
     lines.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(
@@ -720,7 +759,7 @@ fn draw_curves(f: &mut Frame, area: Rect, app: &AppState) {
 
     for (i, pt) in app.crv_points.iter().enumerate() {
         let sel = i == app.crv_sel;
-        let arrow = if sel { "► " } else { "  " };
+        let arrow = if sel { "►" } else { " " };
         let pct = pt.pwm as f32 / 255.0 * 100.0;
 
         let temp_str = if sel && app.crv_editing && app.crv_field == 0 {
@@ -734,14 +773,26 @@ fn draw_curves(f: &mut Frame, area: Rect, app: &AppState) {
             format!("{:>10}", pt.pwm)
         };
 
-        let style = if sel {
+        // The selected row is bold; within it, the column Enter will edit is
+        // reversed. Nothing marked the active column before, so the only way
+        // to learn it was to press Enter and read the prompt.
+        let row = if sel {
             Style::default().add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
+        let cell = |field: u8| {
+            if sel && app.crv_field == field {
+                row.add_modifier(Modifier::REVERSED)
+            } else {
+                row
+            }
+        };
         lines.push(Line::from(vec![
-            Span::styled(format!("{arrow}{temp_str}"), style),
-            Span::styled(format!("    {pwm_str}"), style),
+            Span::styled(arrow.to_string(), row),
+            Span::styled(temp_str, cell(0)),
+            Span::raw("    "),
+            Span::styled(pwm_str, cell(1)),
             Span::raw(format!("    {pct:>5.0}%")),
         ]));
     }
@@ -749,12 +800,19 @@ fn draw_curves(f: &mut Frame, area: Rect, app: &AppState) {
     if let Some(err) = &app.crv_error {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            format!("Daemon rejected: {err}"),
+            format!("Not applied: {err}"),
             Style::default().fg(Color::Red),
         )));
         lines.push(Line::from(Span::styled(
-            "(showing last-accepted curve)",
+            "Your edits are still on screen; the fan keeps its previous curve. Fix and [s], or [r] to reload.",
             Style::default().fg(Color::DarkGray),
+        )));
+    }
+    if let Some(ok) = &app.crv_ok {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            ok.clone(),
+            Style::default().fg(Color::Green),
         )));
     }
 
@@ -892,7 +950,11 @@ fn handle_key(app: &mut AppState, key: crossterm::event::KeyEvent) -> bool {
         KeyCode::Char('4') => {
             app.tab = Tab::Override;
         }
-        KeyCode::Tab => {
+        // Curves and Override use Tab to move between their input fields, so
+        // it must reach them. Catching it here first made those fields
+        // unreachable (the PWM column could never be edited). Number keys
+        // still switch tabs from anywhere.
+        KeyCode::Tab if !matches!(app.tab, Tab::Curves | Tab::Override) => {
             app.tab = Tab::from_index((app.tab.index() + 1) % 4);
         }
         _ => {
@@ -943,6 +1005,25 @@ fn handle_key_history(app: &mut AppState, key: crossterm::event::KeyEvent) {
 
 fn handle_key_curves(app: &mut AppState, key: crossterm::event::KeyEvent) {
     match key.code {
+        KeyCode::Char('c') => {
+            app.crv_channel = 1 - app.crv_channel;
+            app.crv_request_reload();
+            return;
+        }
+        KeyCode::Char('r') => {
+            app.crv_request_reload();
+            return;
+        }
+        _ => {}
+    }
+    // Nothing below may run on points that did not come from the daemon.
+    if !app.crv_loaded || app.crv_points.is_empty() {
+        return;
+    }
+    if matches!(key.code, KeyCode::Char('a' | 'd') | KeyCode::Enter) {
+        app.crv_ok = None;
+    }
+    match key.code {
         KeyCode::Char('j') | KeyCode::Down => {
             if app.crv_sel + 1 < app.crv_points.len() {
                 app.crv_sel += 1;
@@ -962,12 +1043,8 @@ fn handle_key_curves(app: &mut AppState, key: crossterm::event::KeyEvent) {
             };
             app.crv_editing = true;
         }
-        KeyCode::Tab => {
+        KeyCode::Tab | KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l') => {
             app.crv_field = 1 - app.crv_field;
-        }
-        KeyCode::Char('c') => {
-            app.crv_channel = 1 - app.crv_channel;
-            app.crv_error = None;
         }
         KeyCode::Char('a') => {
             let insert_at = (app.crv_sel + 1).min(app.crv_points.len());
@@ -1105,12 +1182,40 @@ pub async fn run_tui(_config: &Path) -> Result<()> {
                 points: app.crv_points.clone(),
             };
             match daemon_request(&req).await {
-                Ok(Response::Ack(qfan_proto::Ack::Ok)) => app.crv_error = None,
+                Ok(Response::Ack(qfan_proto::Ack::Ok)) => {
+                    app.crv_error = None;
+                    app.crv_ok = Some(format!(
+                        "Applied and saved: {} now runs this curve.",
+                        app.crv_channel_name()
+                    ));
+                }
                 Ok(Response::Ack(qfan_proto::Ack::Error { message })) => {
                     app.crv_error = Some(message);
+                    app.crv_ok = None;
                 }
-                Err(e) => app.crv_error = Some(e),
+                Err(e) => {
+                    app.crv_error = Some(e);
+                    app.crv_ok = None;
+                }
                 _ => {}
+            }
+        }
+
+        if app.crv_reload {
+            // One attempt per request; the 1 Hz poll below re-arms it while
+            // the daemon is unreachable, so an offline daemon is not hammered
+            // at the render rate.
+            app.crv_reload = false;
+            match daemon_request(&Request::Config).await {
+                Ok(Response::Config(v)) => match curve_from_config(&v, app.crv_channel_name()) {
+                    Ok(points) => app.crv_apply_loaded(points),
+                    Err(e) => app.crv_load_error = Some(e),
+                },
+                Ok(Response::Ack(qfan_proto::Ack::Error { message })) => {
+                    app.crv_load_error = Some(message)
+                }
+                Ok(_) => app.crv_load_error = Some("unexpected response type".into()),
+                Err(e) => app.crv_load_error = Some(e),
             }
         }
 
@@ -1173,6 +1278,9 @@ pub async fn run_tui(_config: &Path) -> Result<()> {
         if first_tick || last_poll.elapsed() >= POLL_INTERVAL {
             first_tick = false;
             last_poll = std::time::Instant::now();
+            if !app.crv_loaded {
+                app.crv_reload = true;
+            }
 
             match daemon_request(&Request::Status).await {
                 Ok(Response::Status(s)) => {
@@ -1208,11 +1316,26 @@ pub async fn run_tui(_config: &Path) -> Result<()> {
     }
 }
 
+/// Pull one channel's breakpoints out of a `{"op":"config"}` reply.
+fn curve_from_config(v: &serde_json::Value, channel: &str) -> Result<Vec<CurvePoint>, String> {
+    let bp = v
+        .get(channel)
+        .and_then(|c| c.get("breakpoints"))
+        .ok_or_else(|| format!("daemon config has no {channel}.breakpoints"))?;
+    let points: Vec<CurvePoint> = serde_json::from_value(bp.clone())
+        .map_err(|e| format!("bad {channel}.breakpoints: {e}"))?;
+    if points.is_empty() {
+        return Err(format!("daemon reports an empty {channel} curve"));
+    }
+    Ok(points)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qfan_core::Config;
     use qfan_proto::{ChannelStatus, HistorySlot, StatusResponse, TempSnapshot};
     use ratatui::{backend::TestBackend, Terminal};
 
@@ -1440,6 +1563,148 @@ mod tests {
             };
             render_app_to_buffer(&app, 20, 5);
         }
+    }
+
+    // ── Curve editor ──────────────────────────────────────────────────────────
+
+    fn press(app: &mut AppState, code: KeyCode) -> bool {
+        handle_key(
+            app,
+            crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
+        )
+    }
+
+    fn curves_tab() -> AppState {
+        AppState {
+            tab: Tab::Curves,
+            daemon_online: true,
+            ..AppState::default()
+        }
+    }
+
+    fn pwm1_running() -> Vec<CurvePoint> {
+        vec![
+            CurvePoint {
+                temp_c: 35,
+                pwm: 85,
+            },
+            CurvePoint {
+                temp_c: 60,
+                pwm: 180,
+            },
+        ]
+    }
+
+    /// The editor used to open on hardcoded pwm7 values; pressing `s` on the
+    /// pwm1 tab then replaced the real pwm1 curve with pwm7's defaults. Until
+    /// the daemon's curve arrives there must be nothing to submit or edit.
+    #[test]
+    fn nothing_is_editable_or_submittable_before_the_curve_loads() {
+        let mut app = curves_tab();
+        assert!(app.crv_points.is_empty() && !app.crv_loaded);
+        assert!(
+            app.crv_reload,
+            "a fresh editor asks the daemon for its curve"
+        );
+
+        for k in [
+            KeyCode::Char('s'),
+            KeyCode::Enter,
+            KeyCode::Char('a'),
+            KeyCode::Char('d'),
+        ] {
+            press(&mut app, k);
+        }
+
+        assert!(
+            !app.crv_submit,
+            "no submit of points that never came from the daemon"
+        );
+        assert!(!app.crv_editing);
+        assert!(app.crv_points.is_empty());
+        assert!(render_app_to_buffer(&app, 100, 24).contains("Loading the pwm7 curve"));
+    }
+
+    #[test]
+    fn switching_channel_drops_edits_and_reloads() {
+        let mut app = curves_tab();
+        app.crv_apply_loaded(Config::default().pwm7.breakpoints);
+        app.crv_reload = false;
+
+        press(&mut app, KeyCode::Char('c'));
+
+        assert_eq!(app.crv_channel_name(), "pwm1");
+        assert!(
+            app.crv_points.is_empty(),
+            "pwm7's points must not linger on pwm1"
+        );
+        assert!(app.crv_reload && !app.crv_loaded);
+
+        app.crv_apply_loaded(pwm1_running());
+        let screen = render_app_to_buffer(&app, 100, 24);
+        assert!(
+            screen.contains("pwm1") && screen.contains("180"),
+            "{screen}"
+        );
+    }
+
+    /// Tab was swallowed by the global tab switcher, so the PWM column could
+    /// never be selected and only temperatures were editable.
+    #[test]
+    fn tab_moves_between_columns_and_stays_on_the_curves_tab() {
+        let mut app = curves_tab();
+        app.crv_apply_loaded(pwm1_running());
+        assert_eq!(app.crv_field, 0);
+
+        press(&mut app, KeyCode::Tab);
+
+        assert!(app.tab == Tab::Curves, "Tab must not leave the editor");
+        assert_eq!(app.crv_field, 1, "Tab selects the PWM column");
+
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Backspace);
+        for c in "120".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.crv_points[0].pwm, 120);
+        assert_eq!(app.crv_points[0].temp_c, 35, "temperature untouched");
+    }
+
+    #[test]
+    fn tab_still_cycles_tabs_outside_the_editors() {
+        let mut app = AppState::default();
+        press(&mut app, KeyCode::Tab);
+        assert!(app.tab == Tab::History);
+    }
+
+    #[test]
+    fn rejection_keeps_edits_and_says_the_fan_was_not_changed() {
+        let mut app = curves_tab();
+        app.crv_apply_loaded(pwm1_running());
+        app.crv_error = Some("curve rejected: below the 35% duty minimum".into());
+
+        let screen = render_app_to_buffer(&app, 140, 24);
+
+        assert!(screen.contains("Not applied: curve rejected"), "{screen}");
+        assert!(screen.contains("keeps its previous curve"), "{screen}");
+        assert_eq!(app.crv_points, pwm1_running(), "edits kept for fixing");
+    }
+
+    #[test]
+    fn curve_is_read_from_the_config_reply() {
+        let v = serde_json::to_value(Config::default()).unwrap();
+        assert_eq!(curve_from_config(&v, "pwm1").unwrap(), pwm1_running());
+        assert_eq!(
+            curve_from_config(&v, "pwm7").unwrap(),
+            Config::default().pwm7.breakpoints
+        );
+        assert!(curve_from_config(&serde_json::json!({}), "pwm7").is_err());
+        assert!(
+            curve_from_config(&serde_json::json!({"pwm7": {"breakpoints": []}}), "pwm7").is_err()
+        );
     }
 
     #[test]
