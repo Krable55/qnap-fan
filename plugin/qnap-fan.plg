@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name        "qnap-fan">
   <!ENTITY author      "Kyle Rable">
-  <!ENTITY version     "2026.11.25">
+  <!ENTITY version     "2026.11.25a">
   <!ENTITY github      "Krable55/qnap-fan">
   <!ENTITY plugdir     "/boot/config/plugins/&name;">
   <!ENTITY emhttp      "/usr/local/emhttp/plugins/&name;">

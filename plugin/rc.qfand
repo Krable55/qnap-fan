@@ -91,10 +91,26 @@ start() {
     fi
 
     echo "Starting qfand..."
-    "$DAEMON" daemon --config "$CONFIG" &
-    echo $! > "$PIDFILE"
+    "$DAEMON" --config "$CONFIG" daemon &
+    local newpid=$!
+    echo "$newpid" > "$PIDFILE"
+
+    # Verify the daemon is actually alive before claiming success. The install
+    # that shipped `daemon --config` printed "qfand started (pid N)" for a
+    # process that had already exited on an argument-parse error, leaving the
+    # watchdog to ramp fans to 255 while the bash cron script fought it for
+    # control of the EC -- the exact dual-writer state R1 forbids. A start
+    # function that cannot fail is not a start function.
+    sleep 1
+    if ! kill -0 "$newpid" 2>/dev/null; then
+        rm -f "$PIDFILE"
+        echo "ERROR: qfand exited immediately after start; not starting watchdog" >&2
+        echo "       run '$DAEMON --config $CONFIG daemon' by hand to see why" >&2
+        return 1
+    fi
+
     start_watchdog
-    echo "qfand started (pid $(cat "$PIDFILE"))"
+    echo "qfand started (pid $newpid)"
 }
 
 stop() {

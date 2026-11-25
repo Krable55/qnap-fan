@@ -29,9 +29,15 @@ use tokio::net::UnixStream;
 )]
 struct Cli {
     /// Path to the config TOML file.
+    ///
+    /// `global = true` so it is accepted both before and after the subcommand.
+    /// `qfand daemon --config X` is the order an operator reaches for, and
+    /// rc.qfand shipped that order in its start line — clap rejected it with
+    /// "unexpected argument '--config' found" and the daemon never ran.
     #[arg(
         short,
         long,
+        global = true,
         default_value = "/boot/config/plugins/qnap-fan/config.toml"
     )]
     config: PathBuf,
@@ -298,4 +304,60 @@ async fn run_export(
     let mut out = stdout.lock();
 
     qfan_hist::export(&mut rb, from, to, ExportFormat::Csv, &mut out).context("export")
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// The shipped rc.qfand start line must parse. F15: the plugin shipped
+    /// `qfand daemon --config X`, clap rejected it with "unexpected argument
+    /// '--config' found", the daemon never started, and rc.qfand reported
+    /// success anyway. Both orders must work, because both are things a human
+    /// or a script will actually type.
+    #[test]
+    fn config_flag_accepted_before_and_after_subcommand() {
+        let before = Cli::try_parse_from(["qfand", "--config", "/tmp/a.toml", "daemon"])
+            .expect("--config before the subcommand must parse");
+        assert_eq!(before.config, PathBuf::from("/tmp/a.toml"));
+
+        let after = Cli::try_parse_from(["qfand", "daemon", "--config", "/tmp/b.toml"])
+            .expect("--config after the subcommand must parse (the order rc.qfand shipped)");
+        assert_eq!(after.config, PathBuf::from("/tmp/b.toml"));
+    }
+
+    /// The exact command line the shipped rc.qfand uses, including --dry-run.
+    #[test]
+    fn shipped_rc_start_lines_parse() {
+        for args in [
+            vec![
+                "qfand",
+                "--config",
+                "/boot/config/plugins/qnap-fan/config.toml",
+                "daemon",
+            ],
+            vec![
+                "qfand",
+                "daemon",
+                "--config",
+                "/boot/config/plugins/qnap-fan/config.toml",
+            ],
+            vec!["qfand", "daemon", "--dry-run"],
+            vec!["qfand", "--config", "/tmp/c.toml", "daemon", "--dry-run"],
+            vec!["qfand", "status"],
+            vec!["qfand", "tui"],
+        ] {
+            Cli::try_parse_from(args.clone())
+                .unwrap_or_else(|e| panic!("{args:?} must parse, got: {e}"));
+        }
+    }
+
+    /// rc.qfand greps its own start line out of this file in the packaging test
+    /// below; keep the daemon subcommand name stable.
+    #[test]
+    fn daemon_subcommand_is_named_daemon() {
+        let cli = Cli::try_parse_from(["qfand", "daemon"]).expect("must parse");
+        assert!(matches!(cli.command, Command::Daemon { .. }));
+    }
 }
