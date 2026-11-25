@@ -1,0 +1,58 @@
+# qnap-fan default configuration
+# Copy to /boot/config/plugins/qnap-fan/config.toml and edit as needed.
+# All values shown are the compiled-in defaults.
+
+# ── Poll intervals ────────────────────────────────────────────────────────────
+# coretemp is cheap (~0.5 ms); poll fast so the control loop reacts quickly.
+poll_coretemp_s = 2
+
+# EC fan RPM reads are expensive (~18 ms, process spawn). Poll slowly.
+poll_ec_fan_s = 10
+
+# disks.ini is maintained by Unraid; no smartctl calls needed.
+poll_disks_s = 30
+
+# ── Emergency override (§4.3) ─────────────────────────────────────────────────
+# If CPU package temperature reaches this, all owned channels go to PWM 255
+# and an Unraid notification is sent. Latches until temp drops to emergency_release_c.
+emergency_temp_c = 90
+
+# Temperature at which the emergency latch releases and curve control resumes.
+emergency_release_c = 80
+
+# ── CPU fans (pwm7) ───────────────────────────────────────────────────────────
+# fan7_input, fan8_input. Driven by CPU package temperature (trailing 30 s max).
+[pwm7]
+source = "cpu_package"
+# Max PWM decrease per 2 s control cycle. Ramp up is immediate; ramp down is
+# rate-limited to avoid fan surge on brief temperature spikes.
+slew_down_max = 20
+# Deadband in °C to prevent oscillation at a breakpoint.
+hysteresis_c = 3
+
+# 45 °C → 90 PWM (~35% duty): quiet at idle
+[[pwm7.breakpoints]]
+temp_c = 45
+pwm = 90
+
+# 70 °C → 255 PWM (100% duty): full speed before emergency threshold
+[[pwm7.breakpoints]]
+temp_c = 70
+pwm = 255
+
+# ── System fans (pwm1) ────────────────────────────────────────────────────────
+# fan1_input..fan4_input (~1520–1540 RPM at PWM 84). Driven by max drive temp.
+[pwm1]
+source = "max_disk"
+slew_down_max = 20
+hysteresis_c = 3
+
+# 35 °C → 85 PWM: matches existing bash script behaviour at idle drive temps
+[[pwm1.breakpoints]]
+temp_c = 35
+pwm = 85
+
+# 60 °C → 180 PWM: drives are warm but not at emergency levels
+[[pwm1.breakpoints]]
+temp_c = 60
+pwm = 180

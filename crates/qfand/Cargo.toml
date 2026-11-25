@@ -1,0 +1,20 @@
+[package]
+name = "qfand"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "qfand"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+qfan-core = { path = "../qfan-core" }
+qfan-hal = { path = "../qfan-hal" }
+qfan-hist = { path = "../qfan-hist" }
+qfan-proto = { path = "../qfan-proto" }
