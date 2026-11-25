@@ -632,3 +632,64 @@ The terminal-restore tests use a local `MockGuard` with the same Drop shape
 rather than the real `TermGuard`, because the real guard needs a live terminal.
 Drop semantics are verified; the actual escape sequences are not. Will be
 exercised for real during the M9 SSH session on the NAS.
+
+## M9 live cutover — DONE (with F17 outstanding)
+
+qfand is the sole EC PWM writer on the NAS as of 2026-11-25. Release
+v2026.11.25a installed via the real `plugin install` path.
+
+### Verified on live hardware
+
+| Requirement | Evidence |
+|---|---|
+| Plugin installs | download + sha256 OK + unpack, config placed on flash |
+| hwmon discovery | found qnap_ec at hwmon3 by name, no hardcoded index |
+| Curve tracking | 3 min soak: pkg 33-56C, pwm7 155->122->140->160, pwm1 steady 84 |
+| No oscillation | 20C instantaneous swings produced smooth pwm movement (trailing max) |
+| Slew asymmetry | restart ramped 255->235->215->195->175, exactly 20/tick down |
+| R1 single writer | cron line disabled; no control_fans spawn in 140s (>2 cron minutes) |
+| **R2 SIGKILL** | **kill -9 -> both channels 255 within 8s + notification fired** |
+| R6 | pwm21=73 before, during, and after every step |
+| Clean restart | F16 check passed: "started (pid N)" only after liveness verified |
+| webGUI page | php -l clean on installed copy; socket protocol confirmed via `op` |
+
+### F15 / F16 — found ONLY by installing on real hardware
+
+CI was green and the artifact was byte-verified, yet the daemon could not
+start. `rc.qfand` ran `qfand daemon --config X`; `--config` was defined on the
+top-level Cli only, so clap rejected it and the process exited instantly.
+
+F16 is the dangerous half: `rc.qfand` printed "qfand started (pid 1549170)"
+for a process that had already died, then armed the watchdog against a dead
+pid. The watchdog did its job and drove fans to 255 while the bash cron script
+fought it for the EC — the exact dual-writer state R1 exists to forbid. No harm
+(bash reclaimed within a minute) but the lesson is sharp: **a start function
+that cannot fail is not a start function.**
+
+Neither bug was reachable by any test that did not run the real install path.
+Byte-verifying the artifact proved the bytes, not the invocation.
+
+### F18 — disks.ini quotes
+
+Socket API returned `"\"parity\""`. Section-header parse stripped brackets but
+not quotes; the `temp=` branch already used `trim_matches('"')`. Fixed + test.
+
+### F17 — OUTSTANDING: history is never persisted
+
+`qfan-hist` is complete and tested (9 tests) but **not wired into the control
+loop**. `control.rs` imports only `RingBuffer`/`NO_DATA` for the in-memory 30 s
+trailing window; no `FileRingBuffer` is ever opened. Confirmed live:
+
+- `find ... -name "*.qfrb"` → nothing on the box
+- `{"op":"history",...}` → `{"series":"cpu.package","tier":"minute","slots":[]}`
+
+The API answers correctly and will answer empty forever. This is Q1 — the year
+of history — unimplemented at the integration seam while both sides pass their
+own tests. M4 was marked done on the crate's tests; the wiring was never a
+task. Needs: open the three tiers at startup, push each sample, aggregate
+minute→hour, and serve `history` from the files instead of an empty vec.
+
+Rollback: uncomment line 16 of /etc/cron.d/root, HUP crond, then
+`/etc/rc.d/rc.qfand stop`. Backup at
+/boot/config/plugins/qnap-fan-cron-backup-20261124-214320.bak; bash script
+untouched on flash.
