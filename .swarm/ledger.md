@@ -22,13 +22,13 @@ Stable IDs. Never renumber; record approved changes instead.
 |---|---|---|---|---|---|
 | T1 | M0 scaffold: workspace, crates, config schema, CI skeleton | R8 (partial) | — | sonnet-4-6 | DONE, coord-verified |
 | T2 | M1 qfan-hal: hwmon discovery, sysfs + fake backends | R3, R9 | T1 | sonnet-4-6 | DONE, coord-verified (f5059e5) |
-| T3 | M2 qfan-core: curves, slew, hysteresis, overrides | R1, R5 (validation) | T1 | sonnet-4-6 | in progress |
+| T3 | M2 qfan-core: curves, slew, hysteresis, overrides | R1, R5 (validation) | T1 | sonnet-4-6 | DONE, coord-verified (602af33); Opus review in flight |
 | T4 | M3 control loop + failsafe + dry-run | R1, R2, R3 | T2, T3 | sonnet-4-6 | pending |
 | T5 | M4 qfan-hist | R4 | T1 | sonnet-4-6 | DONE, coord-verified (0632b4b) |
 | T6 | M5 socket API + status subcommand | R5 | T4, T5 | sonnet-4-6 | pending |
 | T7 | M6 ratatui TUI | R6 | T6 | sonnet-4-6 | pending |
 | T8 | M7 plugin packaging | R7, R2 (watchdog) | T4 | sonnet-4-6 | pending |
-| T9 | M8 release pipeline | R8 | T1 | sonnet-4-6 | pending |
+| T9 | M8 release pipeline + M7 packaging | R7, R8, R2 | T1 | sonnet-4-6 | fix in progress (F10) |
 | T10 | M9 live cutover | R1, R2, R7 | all | coordinator | pending |
 
 ## Model routing
@@ -161,3 +161,96 @@ down into qfan-core as pure arithmetic and re-export them from qfan-hal (which
 already depends on qfan-core). **Serialized behind T3**: the T3 worker is editing
 qfan-core right now, so applying this concurrently would conflict. Do it after T3
 lands and before T4 consumes either crate.
+
+## T3 verification record (coordinator-run) — commit 602af33
+
+14 tests pass (7 originals intact). Coordinator probes of the safety properties:
+
+```
+60C w/ override 90:  pwm=90  mode=Override{expires_at_secs:1600}
+95C w/ override 90:  pwm=255 mode=Emergency      <- latch beats override
+85C after latch:     pwm=255 mode=Emergency      <- no premature release
+sensor failure:      pwm=255 mode=FailSafe
+ramp up 90->255:     1 cycle
+ramp down 255->90:   9 cycles
+50C->51C in 3C band: pwm=129 == curve@51         <- hysteresis never damps a rise
+ttl=0 / ttl=3601 / ttl=u32::MAX -> Err(InvalidTtl), not clamped
+```
+
+Hysteresis filters the TEMPERATURE SIGNAL, not the PWM output, so the ramp-up
+path never executes deadband logic. Verified against the code, not just the comment.
+
+### A2 applied (closes F9 at source)
+
+`ec_pwm_round` / `ec_pwm_min_write_for` / `DELIVERED_DUTY_FLOOR` /
+`EC_DUTY_FLOOR_35PCT` moved into qfan-core as pure arithmetic; qfan-hal
+re-exports them. `validate()` now compares DELIVERED pwm:
+
+```
+pwm7: curve produces pwm 89 at 80°C, which the EC delivers as 86
+(< 89, below the 35% duty minimum). Use at least 90.
+```
+
+Note: the defaults already used 90, so they were safe by accident, not enforcement.
+
+## T9 verification record (coordinator-run)
+
+- Both workflows are valid YAML (ruby psych): release.yml on `push.tags=[v*]`,
+  1 job / 8 steps; ci.yml 1 job / 7 steps, both ubuntu-latest.
+- R8b artifact-name agreement **verified**: workflow emits
+  `qnap-fan-${VERSION}.txz` + `.txz.sha256`; .plg entities `&PACKAGE;` /
+  `&SHA256FILE;` derive the identical names from `&name;-&version;`. No mismatch.
+- `bash -n` passes on rc.qfand and both extracted `<INLINE>` blocks.
+- Uninstall path sets pwm1/pwm7 to 255, skips pwm21, and preserves flash config.
+- Boot start confirmed: Unraid re-runs each `/boot/config/plugins/*.plg` at boot,
+  and the install block calls `rc.qfand start`, so no `/boot/config/go` edit is needed.
+
+### R2a watchdog — EXERCISED, not just read
+
+Simulated against a fake hwmon tree in TMPDIR with a real `kill -9`:
+
+```
+pwm before:            pwm1=90  pwm7=90
+(SIGKILL the daemon)
+pwm after SIGKILL:     pwm1=255 pwm7=255
+notify log:            "NOTIFY: qfand pid N exited; fans to 100%"
+```
+
+Clean-stop path separately verified to NOT false-alarm: `stop_watchdog` runs
+before the daemon is signalled, fans stay at 90, notify log empty. `local` inside
+the backgrounded subshell works correctly.
+
+### F10 — CRITICAL, fix dispatched
+
+`plugin/qnap-fan.plg` is **not well-formed XML**:
+
+```
+$ xmllint --noout plugin/qnap-fan.plg
+plugin/qnap-fan.plg:65: parser error : xmlParseEntityRef: no name
+(cd "$PLUGDIR" && sha256sum -c "&SHA256FILE;") || {
+...also 66, 67, 126
+```
+
+Bare `&&` and `>&2` inside `<INLINE>` are entity-reference starts. Unraid parses
+.plg with a real XML parser, so the plugin would be rejected at install.
+Precedent pulled from the NAS: the shipping `qnap-ec.plg` IS well-formed, uses no
+CDATA, and escapes as `2>&amp;1`. Fix follows that house style; CDATA is
+explicitly forbidden because it would stop `&PACKAGE;` expanding.
+
+### R7b blocked
+
+`php` is not installed on this Mac, so `php -l plugin/qnap-fan.page` cannot run.
+Recorded as BLOCKED, not PASS. Options: lint on the NAS (php 8.4.23 present) or
+in CI.
+
+## Defect pattern (3 of 3 so far)
+
+Every defect found has been green under its own tooling and broken at a boundary
+that tooling could not see:
+
+- F8 clamp region: unit tests green, curve evaluation unchecked above last breakpoint.
+- F9 intended-vs-delivered: both crates green, composition unsafe.
+- F10 XML vs shell: `bash -n` green, XML parser rejects the same bytes.
+
+**Rule for remaining tasks:** verify at the boundary, in the units and the parser
+that production actually uses.

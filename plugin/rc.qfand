@@ -1,0 +1,171 @@
+#!/bin/bash
+# rc.qfand — start/stop/restart/status for qfand daemon, with failsafe watchdog.
+#
+# Watchdog is a background bash loop independent of qfand.  If qfand is
+# SIGKILLed or OOM-killed (Rust cannot catch either), the watchdog detects
+# the missing pid and writes pwm1=pwm7=255 before qfand's last value locks in.
+
+DAEMON=/usr/local/sbin/qfand
+CONFIG=/boot/config/plugins/qnap-fan/config.toml
+PIDFILE=/var/run/qfand.pid
+WATCHDOG_PIDFILE=/var/run/qfand-watchdog.pid
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+find_qnap_ec_hwmon() {
+    # hwmonN index changes between boots — scan by name, never hardcode a number.
+    grep -rl "qnap_ec" /sys/class/hwmon/*/name 2>/dev/null \
+        | head -1 \
+        | xargs -r dirname 2>/dev/null
+}
+
+fans_to_max() {
+    local hwmon
+    hwmon=$(find_qnap_ec_hwmon)
+    if [ -n "$hwmon" ]; then
+        echo 255 > "$hwmon/pwm1" 2>/dev/null || true
+        echo 255 > "$hwmon/pwm7" 2>/dev/null || true
+        # NOTE: pwm21 is never touched — see DESIGN.md R6.
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Watchdog — runs in background, independent of qfand health.
+# If the daemon pid disappears, sets fans to 255 and sends an Unraid alert.
+# ---------------------------------------------------------------------------
+
+start_watchdog() {
+    (
+        while true; do
+            sleep 10
+            if [ ! -f "$PIDFILE" ]; then
+                # Pidfile removed by a clean stop — exit without firing.
+                break
+            fi
+            local pid
+            pid=$(cat "$PIDFILE" 2>/dev/null)
+            if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+                fans_to_max
+                /usr/local/emhttp/webGui/scripts/notify \
+                    -e "qnap-fan" \
+                    -s "Fan control daemon exited" \
+                    -d "qfand (pid $pid) has exited unexpectedly. Fans set to 100% duty cycle for safety." \
+                    -i "alert" 2>/dev/null || true
+                rm -f "$PIDFILE"
+                break
+            fi
+        done
+    ) &
+    echo $! > "$WATCHDOG_PIDFILE"
+}
+
+stop_watchdog() {
+    if [ -f "$WATCHDOG_PIDFILE" ]; then
+        local wpid
+        wpid=$(cat "$WATCHDOG_PIDFILE" 2>/dev/null)
+        kill "$wpid" 2>/dev/null || true
+        rm -f "$WATCHDOG_PIDFILE"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Service control
+# ---------------------------------------------------------------------------
+
+start() {
+    if [ -f "$PIDFILE" ]; then
+        local pid
+        pid=$(cat "$PIDFILE" 2>/dev/null)
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "qfand is already running (pid $pid)"
+            return 0
+        fi
+        rm -f "$PIDFILE"
+    fi
+
+    if [ ! -x "$DAEMON" ]; then
+        echo "ERROR: $DAEMON not found or not executable" >&2
+        return 1
+    fi
+
+    echo "Starting qfand..."
+    "$DAEMON" daemon --config "$CONFIG" &
+    echo $! > "$PIDFILE"
+    start_watchdog
+    echo "qfand started (pid $(cat "$PIDFILE"))"
+}
+
+stop() {
+    # Stop watchdog first so it does not fire during a clean shutdown.
+    stop_watchdog
+
+    if [ ! -f "$PIDFILE" ]; then
+        echo "qfand is not running"
+        return 0
+    fi
+
+    local pid
+    pid=$(cat "$PIDFILE" 2>/dev/null)
+
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "Stopping qfand (pid $pid)..."
+        kill "$pid"
+        local timeout=15
+        while kill -0 "$pid" 2>/dev/null && [ "$timeout" -gt 0 ]; do
+            sleep 1
+            timeout=$((timeout - 1))
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "qfand did not stop; sending SIGKILL..." >&2
+            kill -9 "$pid" 2>/dev/null || true
+            # Drop guard cannot run after SIGKILL — set fans to max ourselves.
+            fans_to_max
+        fi
+    fi
+
+    rm -f "$PIDFILE"
+    echo "qfand stopped"
+}
+
+status() {
+    if [ -f "$PIDFILE" ]; then
+        local pid
+        pid=$(cat "$PIDFILE" 2>/dev/null)
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "qfand is running (pid $pid)"
+            return 0
+        else
+            echo "qfand is dead (stale pidfile at $PIDFILE)"
+            return 1
+        fi
+    else
+        echo "qfand is not running"
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        start
+        ;;
+    status)
+        status
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}" >&2
+        exit 1
+        ;;
+esac

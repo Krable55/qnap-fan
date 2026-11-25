@@ -1,0 +1,140 @@
+<?xml version='1.0' standalone='yes'?>
+<!DOCTYPE PLUGIN [
+  <!ENTITY name        "qnap-fan">
+  <!ENTITY author      "Kyle Rable">
+  <!ENTITY version     "2026.11.24">
+  <!ENTITY github      "OWNER/qnap-fan">
+  <!ENTITY plugdir     "/boot/config/plugins/&name;">
+  <!ENTITY emhttp      "/usr/local/emhttp/plugins/&name;">
+  <!ENTITY PACKAGE     "&name;-&version;.txz">
+  <!ENTITY SHA256FILE  "&name;-&version;.txz.sha256">
+  <!ENTITY dlbase      "https://github.com/&github;/releases/download/v&version;">
+  <!ENTITY min_unraid  "7.0.0">
+]>
+<!--
+  qnap-fan Unraid plugin installer.
+
+  To install: Plugins → Install Plugin → paste this file's raw URL.
+  To update:  bump &version; and &dlbase; to point at the new release tag.
+
+  IMPORTANT: &github; must be set to the actual GitHub org/repo before first use.
+-->
+<PLUGIN name="&name;"
+        author="&author;"
+        version="&version;"
+        min="&min_unraid;"
+        support="https://github.com/&github;/issues"
+        pluginURL="https://raw.githubusercontent.com/&github;/main/plugin/qnap-fan.plg"
+        icon="fan">
+
+<CHANGES>
+###2026.11.24###
+- Initial release: qfand daemon, rc.qfand with watchdog, settings page.
+</CHANGES>
+
+<!--
+  === Step 1: Download the versioned package ===
+  The file lands in &plugdir; on the flash drive (survives reboots).
+-->
+<FILE Name="&plugdir;/&PACKAGE;">
+  <URL>&dlbase;/&PACKAGE;</URL>
+</FILE>
+
+<!--
+  === Step 2: Download the SHA-256 checksum ===
+-->
+<FILE Name="&plugdir;/&SHA256FILE;">
+  <URL>&dlbase;/&SHA256FILE;</URL>
+</FILE>
+
+<!--
+  === Step 3: Verify checksum and install ===
+-->
+<FILE Run="/bin/bash">
+<INLINE>
+set -e
+
+PLUGDIR="&plugdir;"
+PKG="$PLUGDIR/&PACKAGE;"
+SHA="$PLUGDIR/&SHA256FILE;"
+
+# --- SHA-256 verification ---------------------------------------------------
+# sha256sum -c expects the hash file to contain the filename relative to the
+# current directory; both files land in $PLUGDIR, so cd there first.
+echo "Verifying SHA-256 checksum..."
+(cd "$PLUGDIR" &amp;&amp; sha256sum -c "&SHA256FILE;") || {
+    echo "ERROR: SHA-256 mismatch for &PACKAGE; — aborting install." >&amp;2
+    echo "Delete the cached package and retry, or verify the release artifact." >&amp;2
+    exit 1
+}
+echo "Checksum OK."
+
+# --- Extract package --------------------------------------------------------
+echo "Installing qnap-fan &version;..."
+mkdir -p /usr/local/sbin /etc/rc.d /usr/local/emhttp/plugins/&name;
+tar -xJf "$PKG" -C /
+
+# --- Persist config — never overwrite an existing one ----------------------
+mkdir -p "$PLUGDIR"
+if [ ! -f "$PLUGDIR/config.toml" ]; then
+    echo "Installing default config to $PLUGDIR/config.toml"
+    cp /usr/local/emhttp/plugins/&name;/config.default.toml "$PLUGDIR/config.toml"
+else
+    echo "Existing config preserved at $PLUGDIR/config.toml"
+fi
+
+# --- Make sure rc script is executable and start ----------------------------
+chmod 755 /etc/rc.d/rc.qfand
+chmod 755 /usr/local/sbin/qfand
+
+/etc/rc.d/rc.qfand start
+
+echo "qnap-fan &version; installed."
+</INLINE>
+</FILE>
+
+<!--
+  === Remove method ==========================================================
+  CRITICAL: set pwm1 and pwm7 to 255 before removing the daemon.
+  The EC holds its last value indefinitely with no automatic fallback
+  (DESIGN.md 2.4).  Leaving it at a low value with nothing controlling
+  it is what crashed this server.
+-->
+<FILE Run="/bin/bash" Method="remove">
+<INLINE>
+set -e
+
+echo "Removing qnap-fan..."
+
+# Stop service (rc.qfand stop sends SIGTERM and waits).
+if [ -x /etc/rc.d/rc.qfand ]; then
+    /etc/rc.d/rc.qfand stop 2>/dev/null || true
+fi
+
+# Belt-and-suspenders: set fans to max regardless of how the daemon exited.
+# Scan for the qnap_ec hwmon dynamically — hwmonN changes between boots.
+HWMON=$(grep -rl "qnap_ec" /sys/class/hwmon/*/name 2>/dev/null \
+        | head -1 \
+        | xargs -r dirname 2>/dev/null)
+
+if [ -n "$HWMON" ]; then
+    echo "Setting $HWMON/pwm1 and pwm7 to 255..."
+    echo 255 > "$HWMON/pwm1" 2>/dev/null || true
+    echo 255 > "$HWMON/pwm7" 2>/dev/null || true
+    # NOTE: pwm21 is never touched — DESIGN.md R6.
+else
+    echo "WARNING: qnap_ec hwmon not found — cannot set fans to max." >&amp;2
+fi
+
+# Remove installed files (leave flash config intact for reinstall).
+rm -f /usr/local/sbin/qfand
+rm -f /etc/rc.d/rc.qfand
+rm -rf /usr/local/emhttp/plugins/qnap-fan
+rm -f /var/run/qfand.pid
+rm -f /var/run/qfand-watchdog.pid
+
+echo "qnap-fan removed.  Fans are at 100% duty — install a replacement or reboot."
+</INLINE>
+</FILE>
+
+</PLUGIN>

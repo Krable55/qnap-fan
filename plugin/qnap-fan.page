@@ -1,0 +1,239 @@
+Menu="Utilities"
+Title="QNAP Fan Control"
+Icon="fan"
+---
+<?php
+// qnap-fan.page — Thin shim over /var/run/qfand.sock.
+//
+// DESIGN.md R4: this page MUST NOT poll the EC itself.  Every read goes
+// through the daemon's cached snapshot via the socket.  Direct EC access
+// spawns a process per read (~25x cost); a chatty page would create a
+// fork storm and has already OOM-killed other processes on this box.
+
+define('QFAND_SOCK', '/var/run/qfand.sock');
+define('QFAND_TIMEOUT_S', 2);
+
+/**
+ * Send a single JSON request to qfand and return the decoded response.
+ * Returns null on any error — caller shows "daemon not running" state.
+ */
+function daemon_query(array $request): ?array {
+    if (!file_exists(QFAND_SOCK)) {
+        return null;
+    }
+    $sock = @socket_create(AF_UNIX, SOCK_STREAM, 0);
+    if ($sock === false) {
+        return null;
+    }
+    socket_set_option($sock, SOL_SOCKET, SO_RCVTIMEO, ['sec' => QFAND_TIMEOUT_S, 'usec' => 0]);
+    socket_set_option($sock, SOL_SOCKET, SO_SNDTIMEO, ['sec' => QFAND_TIMEOUT_S, 'usec' => 0]);
+    if (!@socket_connect($sock, QFAND_SOCK)) {
+        socket_close($sock);
+        return null;
+    }
+    $payload = json_encode($request) . "\n";
+    if (@socket_write($sock, $payload, strlen($payload)) === false) {
+        socket_close($sock);
+        return null;
+    }
+    $buf = '';
+    while (true) {
+        $chunk = @socket_read($sock, 4096, PHP_NORMAL_READ);
+        if ($chunk === false || $chunk === '') {
+            break;
+        }
+        $buf .= $chunk;
+        if (str_ends_with(rtrim($chunk), "\n") || strpos($buf, "\n") !== false) {
+            break;
+        }
+    }
+    socket_close($sock);
+    if ($buf === '') {
+        return null;
+    }
+    $decoded = json_decode(trim($buf), true);
+    return is_array($decoded) ? $decoded : null;
+}
+
+// ── Page state ──────────────────────────────────────────────────────────────
+
+$daemon_running = false;
+$status         = null;
+$connect_error  = '';
+$post_result    = null;
+
+if (!file_exists(QFAND_SOCK)) {
+    $connect_error = '/var/run/qfand.sock not found — daemon is not running.';
+} else {
+    $status = daemon_query(['op' => 'status']);
+    if ($status !== null) {
+        $daemon_running = true;
+    } else {
+        $connect_error = 'Socket exists but daemon did not respond within ' . QFAND_TIMEOUT_S . ' s.';
+    }
+}
+
+// ── Handle curve POST ───────────────────────────────────────────────────────
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
+    if (!$daemon_running) {
+        $post_result = ['ok' => false, 'msg' => 'Daemon is not running — cannot apply changes.'];
+    } elseif ($_POST['action'] === 'set_curve') {
+        $channel = in_array($_POST['channel'] ?? '', ['pwm1', 'pwm7'], true)
+            ? $_POST['channel']
+            : null;
+        $points_raw = $_POST['points'] ?? '';
+        $points = json_decode($points_raw, true);
+        if ($channel === null || !is_array($points)) {
+            $post_result = ['ok' => false, 'msg' => 'Invalid channel or points.'];
+        } else {
+            $resp = daemon_query(['op' => 'set_curve', 'channel' => $channel, 'points' => $points]);
+            $post_result = $resp ?? ['ok' => false, 'msg' => 'No response from daemon.'];
+        }
+    } else {
+        $post_result = ['ok' => false, 'msg' => 'Unknown action.'];
+    }
+}
+
+// Helper: format a PWM value as a percentage string.
+function pwm_pct(?int $pwm): string {
+    if ($pwm === null) return '—';
+    return $pwm . ' (' . round($pwm / 255 * 100) . '%)';
+}
+?>
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>QNAP Fan Control</title>
+  <style>
+    body        { font-family: sans-serif; font-size: 14px; color: #222; }
+    h2          { margin-bottom: 4px; }
+    h3          { margin: 20px 0 6px; border-bottom: 1px solid #ccc; padding-bottom: 4px; }
+    .alert-box  { background: #fff3cd; border: 1px solid #ffc107; padding: 10px 14px;
+                  border-radius: 4px; margin: 10px 0; }
+    .ok-box     { background: #d4edda; border: 1px solid #28a745; padding: 10px 14px;
+                  border-radius: 4px; margin: 10px 0; }
+    .err-box    { background: #f8d7da; border: 1px solid #dc3545; padding: 10px 14px;
+                  border-radius: 4px; margin: 10px 0; }
+    table       { border-collapse: collapse; width: 100%; max-width: 640px; }
+    th, td      { text-align: left; padding: 5px 10px; border-bottom: 1px solid #ddd; }
+    th          { font-weight: bold; background: #f5f5f5; }
+    code        { background: #f4f4f4; padding: 1px 4px; border-radius: 3px; }
+    .section    { margin-bottom: 20px; }
+    label       { display: inline-block; min-width: 100px; }
+    input[type=text] { width: 220px; }
+    button      { margin-top: 8px; padding: 4px 14px; }
+  </style>
+</head>
+<body>
+
+<h2>QNAP Fan Control</h2>
+
+<?php if (!$daemon_running): ?>
+<div class="alert-box">
+  <strong>Daemon is not running.</strong><br>
+  <?= htmlspecialchars($connect_error) ?><br><br>
+  Start it with: <code>/etc/rc.d/rc.qfand start</code><br>
+  Check status:  <code>/etc/rc.d/rc.qfand status</code>
+</div>
+
+<?php else: ?>
+
+<?php if ($post_result !== null): ?>
+  <?php if ($post_result['ok'] ?? false): ?>
+    <div class="ok-box">Curve updated successfully.</div>
+  <?php else: ?>
+    <div class="err-box">Error: <?= htmlspecialchars($post_result['msg'] ?? 'unknown') ?></div>
+  <?php endif; ?>
+<?php endif; ?>
+
+<!-- ── Status ─────────────────────────────────────────────────────────── -->
+<div class="section">
+<h3>Daemon Status</h3>
+<table>
+  <tr><th>Mode</th>
+      <td><?= htmlspecialchars($status['mode'] ?? '—') ?></td></tr>
+  <tr><th>Uptime</th>
+      <td><?= htmlspecialchars($status['uptime'] ?? '—') ?></td></tr>
+</table>
+</div>
+
+<!-- ── Fan Channels ───────────────────────────────────────────────────── -->
+<?php if (!empty($status['channels'])): ?>
+<div class="section">
+<h3>Fan Channels</h3>
+<table>
+  <tr><th>Channel</th><th>Intended PWM</th><th>Readback PWM</th><th>RPM</th><th>Mode</th></tr>
+  <?php foreach ($status['channels'] as $ch): ?>
+  <tr>
+    <td><?= htmlspecialchars($ch['name']          ?? '—') ?></td>
+    <td><?= htmlspecialchars(pwm_pct($ch['intended_pwm'] ?? null)) ?></td>
+    <td><?= htmlspecialchars(pwm_pct($ch['readback_pwm'] ?? null)) ?></td>
+    <td><?= htmlspecialchars($ch['rpm']            ?? '—') ?></td>
+    <td><?= htmlspecialchars($ch['mode']           ?? '—') ?></td>
+  </tr>
+  <?php endforeach; ?>
+</table>
+</div>
+<?php endif; ?>
+
+<!-- ── Temperatures ───────────────────────────────────────────────────── -->
+<?php if (!empty($status['temps'])): ?>
+<div class="section">
+<h3>Temperatures</h3>
+<table>
+  <tr><th>Sensor</th><th>°C</th></tr>
+  <?php foreach ($status['temps'] as $k => $v): ?>
+  <tr>
+    <td><?= htmlspecialchars((string)$k) ?></td>
+    <td><?= htmlspecialchars((string)$v) ?></td>
+  </tr>
+  <?php endforeach; ?>
+</table>
+</div>
+<?php endif; ?>
+
+<!-- ── Active Overrides ───────────────────────────────────────────────── -->
+<?php if (!empty($status['overrides'])): ?>
+<div class="section">
+<h3>Active Overrides</h3>
+<table>
+  <tr><th>Channel</th><th>PWM</th><th>Expires</th></tr>
+  <?php foreach ($status['overrides'] as $ov): ?>
+  <tr>
+    <td><?= htmlspecialchars($ov['channel']  ?? '—') ?></td>
+    <td><?= htmlspecialchars(pwm_pct($ov['pwm'] ?? null)) ?></td>
+    <td><?= htmlspecialchars($ov['expires']  ?? '—') ?></td>
+  </tr>
+  <?php endforeach; ?>
+</table>
+</div>
+<?php endif; ?>
+
+<!-- ── Curve Editor ───────────────────────────────────────────────────── -->
+<div class="section">
+<h3>Edit Fan Curve</h3>
+<p>Enter breakpoints as JSON array, e.g. <code>[{"temp_c":45,"pwm":90},{"temp_c":70,"pwm":255}]</code>.
+   The daemon validates the curve before applying it; a curve allowing &lt;35% duty above 80°C is rejected.</p>
+<form method="POST">
+  <input type="hidden" name="action" value="set_curve">
+  <div>
+    <label for="channel">Channel:</label>
+    <select name="channel" id="channel">
+      <option value="pwm7">pwm7 (CPU fans)</option>
+      <option value="pwm1">pwm1 (system fans)</option>
+    </select>
+  </div>
+  <div style="margin-top:8px">
+    <label for="points">Breakpoints:</label>
+    <input type="text" name="points" id="points" placeholder='[{"temp_c":45,"pwm":90},{"temp_c":70,"pwm":255}]'>
+  </div>
+  <button type="submit">Apply Curve</button>
+</form>
+</div>
+
+<?php endif; /* daemon_running */ ?>
+
+</body>
+</html>
