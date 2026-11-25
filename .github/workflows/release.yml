@@ -50,15 +50,19 @@ jobs:
 
           mkdir -p pkg/usr/local/sbin
           mkdir -p pkg/etc/rc.d
+          mkdir -p pkg/etc/logrotate.d
           mkdir -p pkg/usr/local/emhttp/plugins/qnap-fan
 
           cp target/x86_64-unknown-linux-musl/release/qfand pkg/usr/local/sbin/
           cp plugin/rc.qfand                                 pkg/etc/rc.d/
+          cp plugin/qnap-fan.logrotate                       pkg/etc/logrotate.d/qnap-fan
           cp plugin/qnap-fan.page                            pkg/usr/local/emhttp/plugins/qnap-fan/
           cp plugin/config.default.toml                      pkg/usr/local/emhttp/plugins/qnap-fan/
 
           chmod 755 pkg/usr/local/sbin/qfand
           chmod 755 pkg/etc/rc.d/rc.qfand
+          # logrotate skips rule files that are group/world writable.
+          chmod 644 pkg/etc/logrotate.d/qnap-fan
 
           ( cd pkg && tar -cJf "../${PKG_NAME}" --owner=root --group=root . )
 

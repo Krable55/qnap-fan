@@ -1,0 +1,12 @@
+# Installed as /etc/logrotate.d/qnap-fan. Unraid runs logrotate daily.
+# /var/log is a 128 MB RAM disk and qfand logs every PWM write (~0.4 MB/day
+# idle, more under load), so the log must be capped or it fills /var/log.
+# copytruncate: qfand keeps its fd open (opened O_APPEND by rc.qfand).
+/var/log/qfand.log {
+   size 1M
+   rotate 2
+   compress
+   missingok
+   notifempty
+   copytruncate
+}

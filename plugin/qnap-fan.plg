@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
   <!ENTITY name        "qnap-fan">
   <!ENTITY author      "Kyle Rable">
-  <!ENTITY version     "2026.11.25b">
+  <!ENTITY version     "2026.11.25c">
   <!ENTITY github      "Krable55/qnap-fan">
   <!ENTITY plugdir     "/boot/config/plugins/&name;">
   <!ENTITY emhttp      "/usr/local/emhttp/plugins/&name;">
@@ -129,6 +129,7 @@ fi
 # Remove installed files (leave flash config intact for reinstall).
 rm -f /usr/local/sbin/qfand
 rm -f /etc/rc.d/rc.qfand
+rm -f /etc/logrotate.d/qnap-fan
 rm -rf /usr/local/emhttp/plugins/qnap-fan
 rm -f /var/run/qfand.pid
 rm -f /var/run/qfand-watchdog.pid
